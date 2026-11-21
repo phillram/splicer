@@ -1,0 +1,9 @@
+.scratch/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Build output - recreate with `python tools/build_exe.py`
+/Splicer.exe
+build/
+*.spec
