@@ -399,6 +399,8 @@ class App(BaseTk):
         self.last_edit = None              # consecutive edits of one kind undo together
         self.subtitle_choices: dict[str, int | None] = {"Off": None}
         self.cant_reencode = ""            # why this video's cuts must stay on keyframes
+        self.wave: list[float] | None = None  # the sound's shape, for the timeline
+        self.wave_for = None               # (load, sound track) it belongs to
 
         self._style()
         self._build()
@@ -426,12 +428,20 @@ class App(BaseTk):
 
     # --- Settings ---
 
+    SETTING_TYPES = {"geometry": str, "numbered": bool, "joined": bool, "volume": (int, float),
+                     "end_mode": str, "save_as": str, "cut_mode": str, "last_dir": str,
+                     "recent": list, "panes": list}
+
     def _load_settings(self) -> dict:
         try:
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
         except (OSError, ValueError):
             return {}
+        if not isinstance(data, dict):
+            return {}
+        # Anything of the wrong kind (a hand-edited or damaged file) is left out
+        return {k: v for k, v in data.items()
+                if k not in self.SETTING_TYPES or isinstance(v, self.SETTING_TYPES[k])}
 
     def _save(self):
         self.settings["geometry"] = self.geometry()
@@ -1080,6 +1090,7 @@ class App(BaseTk):
         self.player.set_audio(self._audio_track())  # the restored tracks may differ
         self._refresh_tracks()
         self._fill_subtitles()
+        self._measure_wave()
         self.timeline.fit()
         if restored:
             self.status.configure(text="Picked up where you left off with this video. "
@@ -1105,10 +1116,17 @@ class App(BaseTk):
             for index, on in (data.get("tracks") or {}).items():
                 if int(index) in self.track_use:
                     self.track_use[int(index)] = bool(on)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError, KeyError):
             return False
         if not parts:
             return False
+        if not self.anywhere:
+            # Saved while cuts could go anywhere: they go on keyframes now
+            for p in parts:
+                p.start, p.end = self.snap(p.start), self.snap(p.end)
+                p.removed = [[self.snap(a), self.snap(b)] for a, b in p.removed]
+                if p.end - p.start <= EPS:
+                    p.use = False
         self.parts = parts
         self._sorted()
         self._refresh_all()
@@ -1165,8 +1183,32 @@ class App(BaseTk):
         self.track_use[index] = not self.track_use.get(index, False)
         self._refresh_tracks()
         self.player.set_audio(self._audio_track())
+        self._measure_wave()
         self._refresh_parts()  # sound only: the file names follow the sound track
         self._project_changed()
+
+    def _measure_wave(self):
+        """Work out the shape of the sound you hear, in the background, for the timeline."""
+        info, index = self.info, self._audio_track()
+        key = (self.load_id, index)
+        if not info or key == self.wave_for:
+            return
+        self.wave_for, self.wave = key, None
+        self.timeline.draw()
+        if index is None:
+            return
+        if getattr(self, "wave_stop", None):
+            self.wave_stop.set()  # the one for the last video or sound track
+        cancel = self.wave_stop = threading.Event()
+
+        def work():
+            try:
+                peaks = engine.waveform(info.path, index, info.origin, info.duration, cancel)
+            except Exception:  # the timeline just goes without it
+                peaks = None
+            self.events.put(("wave", key, peaks))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _fill_subtitles(self):
         self.subtitle_choices = {"Off": None}
@@ -1774,6 +1816,7 @@ class App(BaseTk):
             self._filling = False
         for side in ("start", "end"):
             self.time_vars[side].set(fmt_time(getattr(part, side)))
+        self.editing = part
         gaps = len(part.removed)
         self.length_label.configure(
             text=f"Length {fmt_time(part.length)}" + (
@@ -1817,7 +1860,11 @@ class App(BaseTk):
         self._project_changed()
 
     def _commit_time(self, side: str):
-        part, info = self._current(), self.info
+        # Clicking another part moves the selection before the box loses focus, so
+        # the time typed belongs to the part the box was showing
+        part, info = getattr(self, "editing", None), self.info
+        if part not in self.parts:
+            part = self._current()
         if not part or not info or self.busy:
             return
         text = self.time_vars[side].get()
@@ -2220,50 +2267,67 @@ class App(BaseTk):
     def _pump(self):
         try:
             for _ in range(200):
-                event = self.events.get_nowait()
-                kind = event[0]
-                if kind == "pos":
-                    self.position = event[1]
-                    self._update_time()
-                elif kind == "state":
-                    self.playing = event[1]
-                    self._update_transport()
-                elif kind == "loaded":
-                    self.redraw_soon()
-                elif kind == "saved":
-                    self.last_output = event[1].parent
-                    self.status.configure(text=f"Saved the frame as {event[1]}")
+                try:
+                    event = self.events.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle(event)
+                except Exception as e:  # keep listening, whatever happened
+                    self.busy = ""
+                    self.status.configure(text=f"Something went wrong: {e}")
                     self._sync()
-                elif kind == "error":
-                    self.status.configure(text=f"Player: {event[1]}")
-                elif kind == "reading" and event[1] == self.load_id:
-                    self.progress.configure(value=event[2])
-                    self.file_detail.configure(text=f"Finding keyframes… {event[2]:.0%}")
-                elif kind == "read" and event[1] == self.load_id:
-                    self.busy = ""
-                    self.progress.configure(value=0)
-                    if event[2] is None:
-                        self.file_detail.configure(text="Stopped.")
-                        self._refresh_all()
-                    else:
-                        self._loaded(event[2])
-                        self._sync()
-                elif kind == "read_failed" and event[1] == self.load_id:
-                    self.busy = ""
-                    self.progress.configure(value=0)
-                    self.file_detail.configure(text="Couldn't read this file.")
-                    self.placeholder.configure(text="Couldn't read this file.")
-                    self._refresh_all()
-                    messagebox.showerror("Splicer", event[2], parent=self)
-                elif kind == "part":
-                    self.status.configure(text=f"Splicing {event[1]} of {event[2]}: {event[3]}")
-                elif kind == "progress":
-                    self.progress.configure(value=event[1])
-                elif kind == "spliced":
-                    self._spliced(event[1], event[2], event[3])
-        except queue.Empty:
-            pass
-        self.after(15, self._pump)
+        finally:
+            self.after(15, self._pump)
+
+    def _handle(self, event):
+        """One message from a worker thread or the player."""
+        kind = event[0]
+        if kind == "pos":
+            self.position = event[1]
+            self._update_time()
+        elif kind == "state":
+            self.playing = event[1]
+            self._update_transport()
+        elif kind == "loaded":
+            self.redraw_soon()
+        elif kind == "wave":
+            if event[1] == self.wave_for:
+                self.wave = event[2]
+                if event[2] is None:
+                    self.wave_for = None  # stopped or failed: try again next time
+                self.timeline.draw()
+        elif kind == "saved":
+            self.last_output = event[1].parent
+            self.status.configure(text=f"Saved the frame as {event[1]}")
+            self._sync()
+        elif kind == "error":
+            self.status.configure(text=f"Player: {event[1]}")
+        elif kind == "reading" and event[1] == self.load_id:
+            self.progress.configure(value=event[2])
+            self.file_detail.configure(text=f"Finding keyframes… {event[2]:.0%}")
+        elif kind == "read" and event[1] == self.load_id:
+            self.busy = ""
+            self.progress.configure(value=0)
+            if event[2] is None:
+                self.file_detail.configure(text="Stopped.")
+                self._refresh_all()
+            else:
+                self._loaded(event[2])
+                self._sync()
+        elif kind == "read_failed" and event[1] == self.load_id:
+            self.busy = ""
+            self.progress.configure(value=0)
+            self.file_detail.configure(text="Couldn't read this file.")
+            self.placeholder.configure(text="Couldn't read this file.")
+            self._refresh_all()
+            messagebox.showerror("Splicer", event[2], parent=self)
+        elif kind == "part":
+            self.status.configure(text=f"Splicing {event[1]} of {event[2]}: {event[3]}")
+        elif kind == "progress":
+            self.progress.configure(value=event[1])
+        elif kind == "spliced":
+            self._spliced(event[1], event[2], event[3])
 
     # --- Closing ---
 

@@ -333,3 +333,59 @@ def test_cut_anywhere_copies_between_keyframes(tmp_path):
     # The pictures from the keyframe at 3.0 to the one at 10.5 are the originals,
     # bar the format settings put back in front of the first of them
     assert out[25:24 + len(copied)] == copied[1:]
+
+
+def test_keyframe_cut_off_keyframes_keeps_sound_with_picture(mkv, tmp_path):
+    # 2.2 and 11.7 aren't keyframes: without re-encoding, the cut goes on the
+    # nearest ones (1.5 and 12.0), sound and picture alike
+    off = engine.cut(mkv, 2.2, 11.7, [0, 1], tmp_path / "off.mkv")
+    on = engine.cut(mkv, 1.5, 12.0, [0, 1], tmp_path / "on.mkv")
+    assert packets(off) == packets(on)
+    # Sound alone can still be cut anywhere
+    sound = engine.cut(mkv, 2.2, 11.7, [1], tmp_path / "sound.m4a")
+    assert packets(sound)[0] == packets(MKV, 2.2, 11.7)[1]
+
+
+def test_chapters_inside_a_part_are_kept(mkv, tmp_path):
+    # 4.5-22.5 covers the end of the first chapter (to 10), the second (to 20) and
+    # the start of the third; 13.5-15 is left out
+    assert [(round(a, 3), round(b, 3), t) for a, b, t in
+            engine.part_chapters(mkv, [(4.5, 13.5), (15.0, 22.5)])] == [
+        (0.0, 5.5, 'Opening: The "Start"'), (5.5, 14.0, "Middle/Part?"), (14.0, 16.5, "Finale")]
+    path = engine.cut(mkv, 4.5, 22.5, [0, 1], tmp_path / "p.mkv", removed=[(13.5, 15.0)])
+    with av.open(str(path)) as c:
+        assert [(float(ch["start"] * ch["time_base"]), ch["metadata"]["title"])
+                for ch in c.chapters()] == [(0.0, 'Opening: The "Start"'),
+                                            (5.5, "Middle/Part?"), (14.0, "Finale")]
+    # One chapter's worth: no chapters written
+    assert engine.part_chapters(mkv, [(10.5, 19.5)]) == []
+
+
+def test_codec_names_are_the_codecs_not_the_decoders():
+    info = engine.probe(FIXTURES / "tone.mp3")
+    track = info.tracks[0]
+    assert track.codec == "MP3"          # not "mp3float"
+    assert engine.sound_ext(track) == ".mp3"
+
+
+def remux(source: Path, dest: Path) -> Path:
+    """The same packets in another kind of file."""
+    with av.open(str(source)) as c, av.open(str(dest), "w") as o:
+        streams = [s for s in c.streams if s.type in ("video", "audio")]
+        mapping = {s.index: o.add_stream_from_template(s, opaque=True) for s in streams}
+        for p in c.demux(*streams):
+            if p.size:
+                p.stream = mapping[p.stream.index]
+                o.mux(p)
+    return dest
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_mpeg_ts(tmp_path, exact):
+    # MPEG-TS seeks by decoding time, which can land past the keyframe wanted
+    info = engine.probe(remux(MKV, tmp_path / "v.ts"))
+    snap = engine.snap_frame if exact else engine.snap
+    s, e = snap(info, 10.4), snap(info, 16.4)
+    path = engine.cut(info, s, e, [0, 1], tmp_path / "part.ts", exact=exact)
+    times = decoded_times(path)
+    assert len(times) == round((e - s) * 30)

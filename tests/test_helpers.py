@@ -63,3 +63,15 @@ def test_tidy_removed():
     assert part.length == 13 - 4 - 2
     # Into the file: 12-15 kept (3 s), 19-20 kept (1 s), then 20-22 left out
     assert (part.into(16), part.into(19.5), part.into(21), part.into(23)) == (3, 3.5, 4, 5)
+
+
+def test_damaged_settings_are_left_out(tmp_path, monkeypatch):
+    import json
+    from splicer import app as appmod
+    bad = tmp_path / "settings.json"
+    bad.write_text(json.dumps({"geometry": 5, "cut_mode": [], "volume": "x", "numbered": False,
+                               "something_new": 1}), encoding="utf-8")
+    monkeypatch.setattr(appmod, "SETTINGS_FILE", bad)
+    assert appmod.App._load_settings(appmod.App) == {"numbered": False, "something_new": 1}
+    bad.write_text("[1, 2]", encoding="utf-8")
+    assert appmod.App._load_settings(appmod.App) == {}
