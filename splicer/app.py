@@ -823,11 +823,16 @@ class App(BaseTk):
         cut_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.cut_btn = tip(ttk.Button(cut_row, text="Cut out a section", command=self.cut_out),
                            "Leave a stretch out of the middle of this part; what's either "
-                           "side of it is joined into one file, still losslessly. It starts "
-                           "at the current time: change its times below, or drag its edges "
-                           "on the timeline.")
+                           "side of it is joined into one file, still losslessly. Press it "
+                           "where the stretch starts, play on, and press it again where it "
+                           "ends. Change its times below, or drag its edges on the timeline.")
         self.cut_btn.pack(side="left")
+        self.cut_note = ttk.Label(cut_row, text="", style="TabNote.TLabel")
+        self.cut_note.pack(side="left", padx=(8, 0))
+        self.cut_cancel_btn = tip(ttk.Button(cut_row, text="Cancel", command=self.cancel_cut),
+                                  "Forget the start that's marked; nothing is left out.")
         self.edit_widgets.append(self.cut_btn)
+        self.cut_from: tuple | None = None  # (part, time) while a cut's start is marked
         self.removed_box = ttk.Frame(edit, style="Tab.TFrame")
         self.removed_box.grid(row=5, column=0, columnspan=2, sticky="ew")
         self.joined_var = tk.BooleanVar(value=self.settings.get("joined", True))
@@ -1629,41 +1634,86 @@ class App(BaseTk):
         info, part = self.info, self._current()
         if not info or not part or self.busy:
             return
-        inside = lambda t: part.start + EPS < t < part.end - EPS  # noqa: E731
-        at = self.snap(self.position)
-        if not inside(at):
-            at = self.snap((part.start + part.end) / 2)
-        if not inside(at):
-            at = self.step_point(part.start, 1)
-        if self.anywhere:
-            end = self.snap(min(at + 3.0, part.end - 0.5))
-        else:
-            end = next((k for k in info.keyframes if k >= at + 2.5 - EPS), None)
-            if end is None or not end < part.end - EPS:
-                end = engine.next_keyframe(info, at)
-        if not (inside(at) and inside(end) and end > at + EPS):
-            self.status.configure(text="This part is too short to cut a section out of: "
-                                       "there aren't keyframes enough inside it.")
+        # Two presses: the first marks where the stretch starts and changes nothing else (no
+        # jump, nothing skipped while playing on); the second, where it ends.
+        mark = self.cut_from
+        if mark is None or mark[0] is not part:
+            at = self.snap(self.position)
+            if not part.start - EPS <= at < part.end - EPS:
+                self.status.configure(text="Go to where the stretch to leave out starts, inside "
+                                           "this part, then press Cut out a section.")
+                self.bell()
+                return
+            self.cut_from = (part, self.position)
+            self._show_cut_mark()
+            self.status.configure(
+                text=f"Cutting from {fmt_time(at)}. Play on to where the stretch ends and "
+                     "press End the cut here.")
+            return
+        a = min(max(self.snap(mark[1]), part.start), part.end)
+        b = min(max(self.snap(self.position), part.start), part.end)
+        a, b = min(a, b), max(a, b)
+        if b - a <= EPS:
+            near = "" if self.anywhere else " (or the same keyframe)"
+            self.status.configure(
+                text=f"That's where the cut starts{near}, so nothing would be left out. Play "
+                     "on to where the stretch ends, then press End the cut here.")
             self.bell()
             return
         self._remember()
-        part.removed.append([at, end])
+        self.cut_from = None
+        part.removed.append([a, b])
         self.shown_part = part
         self._changed(select=part)
-        self.seek(max(at - 2.0, part.start), pause=True)
         self.status.configure(
-            text=f"Left out {fmt_time(at)} to {fmt_time(end)} ({end - at:.2f} s). Change its "
+            text=f"Left out {fmt_time(a)} to {fmt_time(b)} ({b - a:.2f} s). Change its "
                  "times below or drag its edges on the timeline; play across it to see the "
                  "join.")
 
+    def cancel_cut(self):
+        if self.cut_from is not None:
+            self.cut_from = None
+            self._show_cut_mark()
+            self.status.configure(text="Cancelled: nothing is left out.")
+
+    def _show_cut_mark(self):
+        """The Cut out button says what pressing it does next."""
+        part = self._current() if self.info else None
+        if self.cut_from is not None and self.cut_from[0] is not part:
+            self.cut_from = None  # a start marked in another part (or video) is forgotten
+        if self.cut_from is None:
+            self.cut_btn.configure(text="Cut out a section")
+            self.cut_note.configure(text="")
+            self.cut_cancel_btn.pack_forget()
+        else:
+            self.cut_btn.configure(text="End the cut here")
+            self.cut_note.configure(text=f"from {fmt_time(self.snap(self.cut_from[1]))}")
+            self.cut_cancel_btn.pack(side="left", padx=(8, 0))
+
     def move_removed(self, part: Part, i: int, edge: int, t: float,
-                     asked: float | None = None):
+                     asked: float | None = None, carry: bool = False):
         """Move one edge (0: from, 1: to) of a stretch left out of a part. t is on a
-        keyframe; asked is the time typed (or showing), if it was something else."""
+        keyframe; asked is the time typed (or showing), if it was something else. With
+        carry, an edge taken past the other one takes the whole stretch along, keeping
+        its length, rather than refusing."""
         if part not in self.parts or i >= len(part.removed) or self.busy:
             return
         stretch = list(part.removed[i])
         stretch[edge] = min(max(t, part.start), part.end)
+        carried = False
+        if carry and stretch[1] - stretch[0] <= EPS:
+            length = part.removed[i][1] - part.removed[i][0]
+            if edge == 0:
+                other = self.snap(min(stretch[0] + length, part.end))
+                if other <= stretch[0] + EPS:
+                    other = min(self.step_point(stretch[0], 1), part.end)
+                stretch[1] = other
+            else:
+                other = self.snap(max(stretch[1] - length, part.start))
+                if other >= stretch[1] - EPS:
+                    other = max(self.step_point(stretch[1], -1), part.start)
+                stretch[0] = other
+            carried = stretch[1] - stretch[0] > EPS
         if stretch[1] - stretch[0] <= EPS:
             self._say_removed(part, self._too_short(part, i, edge, t, asked), error=True)
             self.bell()
@@ -1683,7 +1733,8 @@ class App(BaseTk):
                                     f"one, {fmt_time(t)}.")
         else:
             self._say_removed(part, "")
-            self.status.configure(text=f"Leaves out {fmt_time(stretch[0])} to "
+            moved = "Moved the whole stretch: it now leaves" if carried else "Leaves"
+            self.status.configure(text=f"{moved} out {fmt_time(stretch[0])} to "
                                        f"{fmt_time(stretch[1])} ({stretch[1] - stretch[0]:.2f} s).")
         self._changed(select=part)
         # Show the join: the last picture before the stretch, or the first after it
@@ -1772,7 +1823,7 @@ class App(BaseTk):
                 now = tip(ttk.Button(row, text="Now", style="Step.TButton",
                                      command=lambda i=i, edge=edge: self.move_removed(
                                          part, i, edge, self.snap(self.position),
-                                         asked=self.position)),
+                                         asked=self.position, carry=True)),
                           "Use the current time in the player.")
                 now.pack(side="left")
                 self.removed_widgets.append(now)
@@ -1796,7 +1847,7 @@ class App(BaseTk):
             var.set(fmt_time(part.removed[i][edge]))
             self.bell()
             return
-        self.move_removed(part, i, edge, self.snap(t), asked=t)
+        self.move_removed(part, i, edge, self.snap(t), asked=t, carry=True)
 
     def _step_removed(self, part: Part, i: int, edge: int, direction: int):
         if part in self.parts and i < len(part.removed) and not self.busy:
@@ -1889,6 +1940,7 @@ class App(BaseTk):
 
     def _show_selected(self):
         part = self._current() if self.info else None
+        self._show_cut_mark()
         if not part:
             self.title_var.set("")
             for side in ("start", "end"):

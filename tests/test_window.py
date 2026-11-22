@@ -141,6 +141,9 @@ def test_left_out_stretches_are_locked_while_splicing(window):
     a.seek(15.0)
     pump(a, 0.2)
     a.cut_out()
+    a.seek(18.0)
+    pump(a, 0.2)
+    a.cut_out()
     part = a._current()
     assert part.removed
     a.busy = "splicing"
@@ -307,3 +310,48 @@ def test_clicking_the_empty_player_opens_a_video(window, monkeypatch):
     a.info = None
     a._video_clicked()
     assert opened
+
+
+def test_cutting_out_marks_the_start_then_the_end(window):
+    a = window
+    a._select(a.parts[1])
+    part = a._current()
+    a.seek(15.0, pause=True)
+    pump(a, 0.2)
+    a.cut_out()
+    assert part.removed == []  # only marked: nothing skipped, no jump
+    assert a.position == 15.0
+    assert a.cut_btn.cget("text") == "End the cut here"
+    a.seek(18.0, pause=True)
+    pump(a, 0.2)
+    a.cut_out()
+    assert part.removed == [[15.0, 18.0]]
+    assert a.cut_btn.cget("text") == "Cut out a section"
+    assert a.position == 18.0
+
+
+def test_a_marked_cut_can_be_cancelled(window):
+    a = window
+    a._select(a.parts[1])
+    a.seek(15.0, pause=True)
+    pump(a, 0.2)
+    a.cut_out()
+    a.cancel_cut()
+    assert a.cut_from is None and a._current().removed == []
+    assert a.cut_btn.cget("text") == "Cut out a section"
+
+
+def test_now_past_the_end_moves_the_whole_stretch(window):
+    a = window
+    a._select(a.parts[1])
+    part = a._current()
+    part.removed = [[12.0, 13.5]]  # keyframes are every 1.5 s
+    a._show_selected()
+    a.seek(16.5, pause=True)
+    pump(a, 0.2)
+    a.move_removed(part, 0, 0, a.snap(a.position), asked=a.position, carry=True)
+    assert part.removed == [[16.5, 18.0]]
+    a.seek(15.0, pause=True)
+    pump(a, 0.2)
+    a.move_removed(part, 0, 1, a.snap(a.position), asked=a.position, carry=True)
+    assert part.removed == [[13.5, 15.0]]

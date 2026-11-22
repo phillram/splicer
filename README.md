@@ -48,9 +48,14 @@ later.
 
 ### Cutting a bit out, or joining parts
 
-Select a part, find the bit you don't want, and hit **Cut out a section**.
-Adjust its times; the timeline shows it as a dark "left out" block. The part
-is saved as one file with that bit removed.
+Select a part, play to where the bit you don't want starts, and hit **Cut out
+a section**. Nothing changes yet: play on to where it ends and hit **End the
+cut here** (or **Cancel**). The timeline shows it as a dark "left out" block,
+and the part is saved as one file with that bit removed.
+
+Adjust its times by typing, with **Now**, or by dragging its edges on the
+timeline. Taking its start past its end (or its end before its start) moves
+the whole stretch along, keeping its length.
 
 To join parts into one file, Ctrl+click them in the list and hit **Join**.
 
