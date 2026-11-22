@@ -37,7 +37,8 @@ python -m splicer
 To change a part, select it and type new start and end times, or press
 **Use current time** (or `I` / `O`) while watching, or drag its edges on the
 timeline. **Add part**, **Split** and **Remove** do what they say. Uncheck a
-part to skip it. Everything can be undone with `Ctrl+Z`.
+part to skip it; Shift+click a checkbox to check or uncheck every part up to
+the last one you clicked. Everything can be undone with `Ctrl+Z`.
 
 The timeline along the bottom shows the sound's waveform, which makes the gaps
 between songs or scenes easy to spot. `Ctrl+wheel` zooms in.
@@ -97,6 +98,7 @@ own description has one, it's filled in for you.
 | Page Up / Page Down | Previous / next part |
 | I O | Set the part's start / end to now |
 | Ctrl+Z Ctrl+Y | Undo / redo |
+| Ctrl+A | Select every part |
 | + − | Zoom the timeline |
 | F, Esc | Full screen, leave it |
 | M | Mute |

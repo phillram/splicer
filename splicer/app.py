@@ -50,7 +50,6 @@ PART_COLUMNS = (  # id, heading, width, anchor, stretch
     ("start", "Start", 88, "e", False),
     ("end", "End", 88, "e", False),
     ("length", "Length", 80, "e", False),
-    ("file", "File name", 220, "w", True),
 )
 
 SHORTCUTS = """Space  play / pause
@@ -64,7 +63,11 @@ Ctrl+Z  Ctrl+Y  undo / redo
 +  −  zoom the timeline in / out
 S  save the frame as a picture
 F  full screen (Esc to leave)
-M  mute"""
+M  mute
+
+On the timeline: drag a cut to move it, click to jump there,
+wheel to scroll, Ctrl+wheel to zoom.
+Shift+click a checkbox to check or uncheck all the parts up to it."""
 
 
 @dataclass(eq=False)
@@ -465,7 +468,8 @@ class App(BaseTk):
     def _restore_sashes(self):
         self.update_idletasks()
         saved = self.settings.get("panes")
-        ok = isinstance(saved, list) and len(saved) == 2
+        ok = isinstance(saved, list) and len(saved) == 2 and \
+            all(isinstance(v, int) for v in saved)
         width, height = self.upper.winfo_width(), self.outer.winfo_height()
         main = saved[0] if ok else int(width * 0.42)
         lower = saved[1] if ok else height - int(165 * self.scale)
@@ -567,7 +571,7 @@ class App(BaseTk):
         status.pack(side="bottom", fill="x")
         self.status = ttk.Label(status, text=f"Splicer {__version__}", style="Bar.TLabel")
         self.status.pack(side="left", fill="x", expand=True)
-        keys = ttk.Label(status, text="Keyboard shortcuts", style="Bar.TLabel", cursor="hand2")
+        keys = ttk.Label(status, text="Shortcuts", style="Bar.TLabel", cursor="hand2")
         keys.pack(side="right")
         tip(keys, SHORTCUTS)
 
@@ -674,7 +678,9 @@ class App(BaseTk):
                             "Show the folder the parts were saved in.")
         self.open_btn.pack(side="right", padx=(0, 6))
         self.progress = ttk.Progressbar(row, maximum=1.0, length=120)
-        self.progress.pack(side="right", padx=(0, 10))
+        self.cancel_btn.pack_forget()
+        self.open_btn.pack_forget()
+        self.shown_actions = []
 
     def _build_tracks(self, box):
         note = ttk.Label(box, text="Checked tracks go into every part, and the first checked "
@@ -711,10 +717,10 @@ class App(BaseTk):
         more = ttk.Menubutton(head, text="More", menu=self.more_menu)
         more.pack(side="right", padx=(4, 0))
         self.part_buttons.append(more)
-        self.redo_btn = tip(ttk.Button(head, text="↷", style="Step.TButton",
+        self.redo_btn = tip(ttk.Button(head, text="Redo",
                                        command=self.do_redo), "Redo (Ctrl+Y)")
         self.redo_btn.pack(side="right", padx=(4, 0))
-        self.undo_btn = tip(ttk.Button(head, text="↶", style="Step.TButton",
+        self.undo_btn = tip(ttk.Button(head, text="Undo",
                                        command=self.do_undo), "Undo (Ctrl+Z)")
         self.undo_btn.pack(side="right", padx=(12, 0))
         for text, command, help_text in (
@@ -753,6 +759,8 @@ class App(BaseTk):
         self.tree.bind("<Button-1>", self._tree_click)
         self.tree.bind("<<TreeviewSelect>>", lambda e: self._show_selected())
         self.tree.bind("<Delete>", lambda e: self._remove_parts())
+        self.tree.bind("<Control-a>", lambda e: (
+            self.tree.selection_set(self.tree.get_children()), "break")[1])
         self.tree.bind("<Double-1>", lambda e: (self.title_entry.focus_set(),
                                                 self.title_entry.select_range(0, "end")))
 
@@ -817,7 +825,7 @@ class App(BaseTk):
         self.removed_box = ttk.Frame(edit, style="Tab.TFrame")
         self.removed_box.grid(row=5, column=0, columnspan=2, sticky="ew")
         self.joined_var = tk.BooleanVar(value=self.settings.get("joined", True))
-        tip(ttk.Checkbutton(edit, text="Keep touching parts joined", variable=self.joined_var,
+        tip(ttk.Checkbutton(edit, text="Moving a cut moves the part next to it", variable=self.joined_var,
                             style="Tab.TCheckbutton"),
             "When a part ends where the next one starts, moving that cut moves both, so "
             "nothing falls between them.").grid(row=6, column=0, columnspan=2, sticky="w",
@@ -868,9 +876,17 @@ class App(BaseTk):
             self.transport.append(b)
         self.time_label = ttk.Label(row, text="", style="Time.TLabel")
         self.time_label.pack(side="left", padx=(12, 0))
+        self.full_btn = tip(ttk.Button(row, text="⛶", style="Transport.TButton",
+                                       command=self.enter_full_screen),
+                            "Full screen (F, or double-click the picture). Esc leaves.")
+        self.full_btn.pack(side="right")
+        self.frame_btn = tip(ttk.Button(row, text="Save frame", command=self.save_frame),
+                             "Save the picture in the player, at full size, as a PNG in the "
+                             "folder the parts go to (S).")
+        self.frame_btn.pack(side="right", padx=(0, 4))
         row = ttk.Frame(controls)
         row.pack(fill="x", pady=(6, 0))
-        ttk.Label(row, text="At the end of the part").pack(side="left")
+        ttk.Label(row, text="At the end").pack(side="left")
         self.end_mode = self.settings.get("end_mode", "stop")
         if self.end_mode not in END_MODES:
             self.end_mode = "stop"
@@ -884,24 +900,13 @@ class App(BaseTk):
         ttk.Label(row, text="Subtitles").pack(side="left", padx=(14, 0))
         self.subtitle_var = tk.StringVar(value="Off")
         self.subtitle_box = ttk.Combobox(row, textvariable=self.subtitle_var, state="readonly",
-                                         width=18, values=["Off"])
+                                         width=16, values=["Off"])
         self.subtitle_box.pack(side="left", padx=(6, 0))
         self.subtitle_box.bind("<<ComboboxSelected>>", lambda e: self._subtitles_changed())
         tip(self.subtitle_box, "Subtitles to show in the player. Only text subtitles can be "
             "shown here; every checked subtitle track goes into the parts either way.")
-
-        row = ttk.Frame(controls)
-        row.pack(fill="x", pady=(6, 0))
-        self.frame_btn = tip(ttk.Button(row, text="Save frame", command=self.save_frame),
-                             "Save the picture in the player, at full size, as a PNG in the "
-                             "folder the parts go to (S).")
-        self.frame_btn.pack(side="left")
-        self.full_btn = tip(ttk.Button(row, text="⛶  Full screen",
-                                       command=self.enter_full_screen),
-                            "Watch full screen (F, or double-click the picture). Esc leaves.")
-        self.full_btn.pack(side="left", padx=(6, 0))
         self.volume_var = tk.DoubleVar(value=self.settings.get("volume", 80))
-        volume = ttk.Scale(row, from_=0, to=100, variable=self.volume_var, length=110,
+        volume = ttk.Scale(row, from_=0, to=100, variable=self.volume_var, length=90,
                            command=lambda v: self.player.set_volume(self._volume()))
         volume.pack(side="right")
         self.mute_btn = tip(ttk.Button(row, text="🔊", style="Transport.TButton",
@@ -912,9 +917,6 @@ class App(BaseTk):
         head = ttk.Frame(box)
         head.pack(fill="x")
         ttk.Label(head, text="Timeline", style="Section.TLabel").pack(side="left")
-        ttk.Label(head, text="Drag a cut to move it  ·  click to jump there  ·  "
-                  "Ctrl+wheel zooms, wheel scrolls", style="Note.TLabel"
-                  ).pack(side="left", padx=(10, 0))
         self.zoom_buttons = []
         for text, command, help_text in (
                 ("Whole video", lambda: self.timeline.fit(), "Show the whole video."),
@@ -1422,12 +1424,13 @@ class App(BaseTk):
             self.tree.insert("", "end", iid=part.iid, tags=tags, values=(
                 CHECKED if part.use else UNCHECKED,
                 f"{n:0{width}}" if part.use else "",
-                part.title, fmt_time(part.start), fmt_time(part.end), fmt_time(part.length),
-                names.get(part, "not saved")))
+                part.title, fmt_time(part.start), fmt_time(part.end), fmt_time(part.length)))
         if keep:
             self.tree.selection_set([p.iid for p in keep if p in self.parts])
         if focused in self.parts:
             self.tree.focus(focused.iid)  # emptied by the rebuild
+        if self.info and getattr(self, "editing", None) in self.parts:
+            self._describe(self.editing)  # its file name may have changed
         used = [p for p in self.parts if p.use]
         if self.info:
             total = sum(p.length for p in used)
@@ -1491,8 +1494,17 @@ class App(BaseTk):
         iid = self.tree.identify_row(event.y)
         if self.tree.identify_column(event.x) == "#1" and iid and not self.busy:
             part = next(p for p in self.parts if p.iid == iid)
+            use = not part.use
+            group = [part]
+            anchor = getattr(self, "check_anchor", None)
+            if event.state & 0x0001 and anchor in self.parts:
+                # Shift+click: every part from the last checkbox clicked to this one
+                a, b = sorted((self.parts.index(anchor), self.parts.index(part)))
+                group = self.parts[a:b + 1]
             self._remember()
-            part.use = not part.use
+            for p in group:
+                p.use = use
+            self.check_anchor = part
             self._changed()
             return "break"
         return None
@@ -1834,6 +1846,19 @@ class App(BaseTk):
 
     # --- The selected part ---
 
+    def _describe(self, part: Part):
+        """The note under the part's times: its length, what's re-encoded, its file."""
+        gaps = len(part.removed)
+        text = f"Length {fmt_time(part.length)}" + (
+            f"  ({gaps} stretch{'es' * (gaps != 1)} left out)" if gaps else "")
+        if self.anywhere:
+            redo = engine.reencoded(self.info, part.kept)
+            if redo > EPS:
+                text += f"\nRe-encodes {redo:.1f} s of picture near its cuts"
+        name = self._names().get(part)
+        text += f"\nSaved as {name}" if name else "\nUnchecked, so not saved"
+        self.length_label.configure(text=text)
+
     def _show_selected(self):
         part = self._current() if self.info else None
         if not part:
@@ -1855,17 +1880,7 @@ class App(BaseTk):
         for side in ("start", "end"):
             self.time_vars[side].set(fmt_time(getattr(part, side)))
         self.editing = part
-        gaps = len(part.removed)
-        self.length_label.configure(
-            text=f"Length {fmt_time(part.length)}" + (
-                f"  ({gaps} stretch{'es' * (gaps != 1)} left out, the rest joined)"
-                if gaps else ""))
-        if self.anywhere:
-            redo = engine.reencoded(self.info, part.kept)
-            if redo > EPS:
-                self.length_label.configure(
-                    text=self.length_label.cget("text")
-                    + f"  ·  re-encodes {redo:.1f} s of picture near its cuts")
+        self._describe(part)
         self._fill_removed(part)
         self.side_notes["start"].configure(
             text="the start of the video" if part.start <= EPS else "")
@@ -2165,7 +2180,7 @@ class App(BaseTk):
                 return
             ext = engine.sound_ext(sound)
             tracks = [sound.index]
-            if ext in (".mka", ".m4a"):  # these can carry the cover art too
+            if ext == ".mka":  # carries the cover art too (FFmpeg can't put it in .m4a)
                 tracks += [i for i, on in self.track_use.items() if on and kinds[i] == "cover"]
         else:
             tracks = [i for i, on in self.track_use.items() if on]
@@ -2248,7 +2263,8 @@ class App(BaseTk):
                 done_length += length
             self.events.put(("spliced", written, failed, False))
 
-        threading.Thread(target=work, daemon=True).start()
+        self.splicer_thread = threading.Thread(target=work, daemon=True)
+        self.splicer_thread.start()
 
     def _cancel(self):
         if self.busy:
@@ -2306,9 +2322,18 @@ class App(BaseTk):
         state(self.full_btn, has_picture)
         state(self.frame_btn, has_picture)
         state(self.splice_btn, idle and loaded and any(p.use for p in self.parts))
-        state(self.cancel_btn, bool(self.busy))
-        state(self.open_btn, idle and self.last_output is not None
-              and self.last_output.is_dir())
+        # Cancel and the progress bar only while busy; Open folder once there's a folder
+        open_folder = idle and self.last_output is not None and self.last_output.is_dir()
+        shown = [w for w, on in ((self.cancel_btn, not idle), (self.open_btn, open_folder),
+                                 (self.progress, not idle)) if on]
+        if shown != self.shown_actions:
+            for w in self.shown_actions:
+                w.pack_forget()
+            beside = self.splice_btn
+            for w in shown:
+                w.pack(side="right", padx=(0, 10 if w is self.progress else 6), after=beside)
+                beside = w
+            self.shown_actions = shown
 
     def _pump(self):
         try:
@@ -2384,6 +2409,12 @@ class App(BaseTk):
                                        "finished ones stay.", parent=self):
                 return
         self.cancel.set()
+        # Let the part being written stop and remove itself before the process ends
+        worker = getattr(self, "splicer_thread", None)
+        if worker is not None and worker.is_alive():
+            self.status.configure(text="Stopping…")
+            self.update_idletasks()
+            worker.join(timeout=30)
         self._save_project_now()
         self.player.close()
         self._save()
@@ -2397,7 +2428,7 @@ def main() -> int:
         pass
     app = App()
     # A video dropped on Splicer.exe, or opened with it, opens straight away
-    if paths := [Path(arg) for arg in sys.argv[1:] if Path(arg).is_file()]:
+    if paths := [Path(arg).resolve() for arg in sys.argv[1:] if Path(arg).is_file()]:
         app.after(200, lambda: app.open_video(paths[0]))
     app.mainloop()
     return 0

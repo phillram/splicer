@@ -34,7 +34,16 @@ def wait(window, test, timeout: float = 20.0):
 def window(tmp_path, monkeypatch):
     # Its own empty settings, and nothing saved anywhere
     monkeypatch.setattr(appmod, "SETTINGS_FILE", tmp_path / "settings.json")
+    # Message boxes are noted, never shown: nothing may pop up on the screen
+    shown = []
+    for name in ("showinfo", "showerror", "showwarning"):
+        monkeypatch.setattr(appmod.messagebox, name,
+                            lambda *args, n=name, **kw: shown.append((n, args)))
+    for name in ("askyesno", "askokcancel", "askyesnocancel"):
+        monkeypatch.setattr(appmod.messagebox, name,
+                            lambda *args, n=name, **kw: shown.append((n, args)) or True)
     a = appmod.App()
+    a.shown_messages = shown
     a.attributes("-alpha", 0.0)  # never shows on screen
     a.lower()
     a._save = lambda: None
@@ -155,3 +164,73 @@ def test_splice_takes_a_time_still_being_typed(window, tmp_path):
     assert a.parts[0].end == 6.0
     files = list((tmp_path / "out").iterdir())
     assert len(files) == 1
+
+
+def click_checkbox(a, part, shift=False):
+    x, y, w, h = a.tree.bbox(part.iid, "#1")
+    state = 1 if shift else 0
+    a.tree.event_generate("<Shift-Button-1>" if shift else "<Button-1>",
+                          x=x + w // 2, y=y + h // 2, state=state)
+    a.update()
+
+
+def test_shift_click_checks_the_parts_in_between(window):
+    a = window
+    click_checkbox(a, a.parts[0])  # off
+    assert [p.use for p in a.parts] == [False, True, True]
+    click_checkbox(a, a.parts[2], shift=True)  # off, and everything up to it
+    assert [p.use for p in a.parts] == [False, False, False]
+    click_checkbox(a, a.parts[1])  # on
+    click_checkbox(a, a.parts[0], shift=True)
+    assert [p.use for p in a.parts] == [True, True, False]
+    a.do_undo()  # one step for the whole range
+    assert [p.use for p in a.parts] == [False, True, False]
+
+
+def test_ctrl_a_selects_every_part(window):
+    a = window
+    a.tree.focus_set()
+    a.tree.event_generate("<Control-a>")
+    assert len(a._selected_parts()) == 3
+
+
+def test_busy_buttons_only_while_busy(window, tmp_path):
+    a = window
+    assert not a.cancel_btn.winfo_ismapped() and not a.progress.winfo_ismapped()
+    a.busy = "splicing"
+    a._sync()
+    a.update()
+    assert a.cancel_btn.winfo_ismapped() and a.progress.winfo_ismapped()
+    a.busy = ""
+    a.last_output = tmp_path
+    a._sync()
+    a.update()
+    assert not a.cancel_btn.winfo_ismapped() and a.open_btn.winfo_ismapped()
+
+
+def test_the_file_name_follows_the_settings(window):
+    a = window
+    a._select(a.parts[1])
+    assert "Saved as 02 - " in a.length_label.cget("text")
+    a.numbered_var.set(False)
+    a._refresh_parts()
+    assert "Saved as 02 - " not in a.length_label.cget("text")
+    click_checkbox(a, a.parts[1])
+    assert "not saved" in a.length_label.cget("text")
+
+
+def test_sound_only_from_a_video_with_cover_art(window, tmp_path):
+    a = window
+    a.open_video(FIXTURES / "withcover.mp4")
+    wait(a, lambda: a.info is not None and not a.busy)
+    a.save_as_var.set(appmod.SAVE_AS["sound"])
+    a._save_as_changed()
+    for p in a.parts:
+        p.use = p is a.parts[0]
+    a._refresh_parts()
+    a.output_var.set(str(tmp_path / "out"))
+    a._splice()
+    wait(a, lambda: not a.busy, 60)
+    files = list((tmp_path / "out").iterdir())
+    assert len(files) == 1 and files[0].suffix == ".m4a"
+    assert not a.shown_messages
