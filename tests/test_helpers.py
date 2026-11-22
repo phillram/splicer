@@ -52,3 +52,14 @@ def test_parts_from_times():
     parts = parts_from_times(info, [(0, "A"), (10, ""), (20, "C"), (99, "Past the end")])
     assert [(p.title, p.start, p.end) for p in parts] == [
         ("A", 0.0, 10.5), ("Part 2", 10.5, 19.5), ("C", 19.5, info.duration)]
+
+
+def test_tidy_removed():
+    from splicer.app import tidy_removed
+    part = Part("A", 10, 30, removed=[[20, 22], [15, 18], [17, 19], [25, 40], [5, 12]])
+    tidy_removed(part)
+    # Overlaps merged; one reaching an end just moves that end in
+    assert (part.start, part.end, part.removed) == (12, 25, [[15, 19], [20, 22]])
+    assert part.length == 13 - 4 - 2
+    # Into the file: 12-15 kept (3 s), 19-20 kept (1 s), then 20-22 left out
+    assert (part.into(16), part.into(19.5), part.into(21), part.into(23)) == (3, 3.5, 4, 5)

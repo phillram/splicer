@@ -236,3 +236,42 @@ def test_sound_only(mkv, tmp_path):
     with av.open(str(path)) as c:
         assert [st.type for st in c.streams] == ["audio"]
         assert c.metadata.get("track") == "2/3" and c.metadata.get("album") == "Test Movie"
+
+
+def test_segments():
+    assert engine.segments(0, 10, [(3, 4), (6, 7)]) == [(0, 3), (4, 6), (7, 10)]
+    assert engine.segments(0, 10, [(-1, 2), (9, 12)]) == [(2, 9)]
+    assert engine.segments(0, 10, [(0, 10)]) == []
+
+
+@pytest.mark.parametrize("source", [MKV, MP4])
+def test_removed_stretch_is_left_out_and_the_rest_joined(tmp_path, source):
+    info = engine.probe(source)
+    start, end, removed = 3.0, 15.0, [(6.0, 9.0), (12.0, 13.5)]
+    path = engine.cut(info, start, end, [0, 1], tmp_path / f"joined{source.suffix}",
+                      removed=removed)
+    kept = engine.segments(start, end, removed)
+    for index in (0, 1):
+        expected = [h for s, e in kept for _, h in packets(source, s, e)[index]]
+        assert [h for _, h in packets(path)[index]] == expected
+    with av.open(str(path)) as c:
+        times = [float(f.pts * f.time_base) for f in c.decode(video=0)]
+    assert len(times) == round(sum(e - s for s, e in kept) * 30)
+    assert times == sorted(times) and times[0] < 0.05
+
+
+def test_nothing_left(mkv, tmp_path):
+    with pytest.raises(engine.SpliceError):
+        engine.cut(mkv, 3, 6, [0], tmp_path / "x.mkv", removed=[(0, 10)])
+
+
+def test_subtitles_across_a_join(mkv, tmp_path):
+    path = engine.cut(mkv, 0, mkv.duration, [0, 4], tmp_path / "j.mkv",
+                      removed=[(3.0, 10.5), (15.0, 19.5)])
+    with av.open(str(path)) as c:
+        lines = [(round(float(p.pts * p.time_base), 2), round(float(p.duration * p.time_base), 2),
+                  bytes(p).decode()) for p in c.demux(c.streams.subtitles[0]) if p.size]
+    # Kept 0-3, 10.5-15, 19.5-end: the first line stops at the join, the one on screen
+    # at 10.5 carries on from it, and the lines in the left-out stretches are gone
+    assert lines == [(1.0, 2.0, "Bonjour from part one"),
+                     (3.0, 2.5, "This one spans the cut at 10s")]

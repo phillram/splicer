@@ -1,13 +1,14 @@
 """The two bars that show the video along its length.
 
 Overview: the whole video in one thin bar, under the picture. Click or drag to
-move the playhead.
+jump there.
 
 Timeline: the editing bar along the bottom of the window. It zooms (Ctrl+wheel,
 or the buttons) from the whole video down to a few seconds, scrolls (wheel),
 shows a time ruler, every part with its name, the chapters and, close up,
-every keyframe. Drag a part's edge to move that cut; click or drag anywhere
-else to move the playhead; double-click a part to select it.
+every keyframe. Drag a part's edge, or the edge of a stretch left out of one,
+to move that cut; click or drag anywhere else to jump there; double-click a
+part to select it.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ BG, PANEL, FIELD, HOVER = "#1e1f22", "#2b2d31", "#383a40", "#4e5058"
 FG, MUTED, ACCENT, WARN = "#e6e6e6", "#9a9ca3", "#5865f2", "#faa61a"
 SEGMENTS = ("#3c4270", "#4a5190")
 OFF_SEGMENT = "#34363c"
+CUT = "#141518"        # a stretch left out of a part
 EDGE_GRAB = 6  # pixels either side of a cut that pick it up
 
 STEPS = (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200)
@@ -75,6 +77,9 @@ class Overview(tk.Canvas):
             color = ACCENT if part.iid in selected else SEGMENTS[i % 2] if part.use \
                 else OFF_SEGMENT
             self.create_rectangle(x0, 5, max(x1, x0 + 1), h - 3, fill=color, width=0)
+            for r0, r1 in part.removed:
+                self.create_rectangle(1 + r0 * scale, 5, max(1 + r1 * scale, 2 + r0 * scale),
+                                      h - 3, fill=CUT, width=0)
         for ch in app.info.chapters:
             x = 1 + ch.start * scale
             self.create_line(x, 0, x, 4, fill=WARN, width=2)
@@ -210,6 +215,13 @@ class Timeline(tk.Canvas):
                                   fill=color, outline=FG if on else "", width=1)
             self.create_line(x0, self.LANE_TOP - 2, x0, lane_bottom + 2, fill=FG)
             self.create_line(x1, self.LANE_TOP - 2, x1, lane_bottom + 2, fill=FG)
+            for r0, r1 in part.removed:
+                c0, c1 = self.x(r0), self.x(r1)
+                self.create_rectangle(c0, self.LANE_TOP + 1, max(c1, c0 + 2), lane_bottom - 1,
+                                      fill=CUT, outline=WARN, dash=(3, 3))
+                if c1 - c0 > 50:
+                    self.create_text((c0 + c1) / 2, (self.LANE_TOP + lane_bottom) / 2,
+                                     text="left out", fill=WARN, font=self.small)
             room = min(x1, width) - max(x0, 0) - 10
             if room > 24:
                 text = self._fit_text(part.title, room)
@@ -283,12 +295,21 @@ class Timeline(tk.Canvas):
         best, gap = None, EDGE_GRAB + 1
         selected = {p.iid for p in self.app._selected_parts()}
         for part in self.app.parts:
-            for side in ("start", "end"):
-                d = abs(self.x(getattr(part, side)) - x)
+            edges = [(side, getattr(part, side)) for side in ("start", "end")]
+            edges += [(("removed", i, k), r[k]) for i, r in enumerate(part.removed)
+                      for k in (0, 1)]
+            for side, t in edges:
+                d = abs(self.x(t) - x)
                 # A cut shared by two parts: the selected one's wins
                 if d < gap or (d == gap and part.iid in selected):
                     best, gap = (part, side), d
         return best if gap <= EDGE_GRAB else None
+
+    @staticmethod
+    def _edge_time(part, side) -> float:
+        if isinstance(side, tuple):
+            return part.removed[side[1]][side[2]]
+        return getattr(part, side)
 
     def _hover(self, event):
         if self.drag:
@@ -302,7 +323,7 @@ class Timeline(tk.Canvas):
         edge = self._edge_at(event.x, event.y)
         if edge:
             part, side = edge
-            self.drag = ("edge", part, side, getattr(part, side))
+            self.drag = ("edge", part, side, self._edge_time(part, side))
             self.app._select(part, seek=False)
         else:
             self.drag = ("scrub",)
@@ -334,8 +355,11 @@ class Timeline(tk.Canvas):
             return
         _, part, side, original = drag
         if self.ghost is not None and abs(self.ghost - original) > EPS:
-            self.app.move_cut(part, side, self.ghost)
-        else:
+            if isinstance(side, tuple):
+                self.app.move_removed(part, side[1], side[2], self.ghost)
+            else:
+                self.app.move_cut(part, side, self.ghost)
+        elif not isinstance(side, tuple):
             self.app.go_part_edge(side)
         self.ghost = None
 

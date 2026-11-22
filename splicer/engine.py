@@ -339,19 +339,40 @@ def _clean_tags(tags: dict) -> dict:
     return {k: v for k, v in tags.items() if not STALE_TAGS.match(k)}
 
 
+def segments(start: float, end: float, removed=()) -> list[tuple[float, float]]:
+    """What's kept of start..end once the removed stretches are taken out."""
+    kept, at = [], start
+    for r0, r1 in sorted(removed):
+        r0, r1 = max(r0, start), min(r1, end)
+        if r1 - r0 <= EPS:
+            continue
+        if r0 - at > EPS:
+            kept.append((at, r0))
+        at = max(at, r1)
+    if end - at > EPS:
+        kept.append((at, end))
+    return kept
+
+
 def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
         title: str = "", progress: Callable[[float], None] | None = None,
-        cancel: threading.Event | None = None, tags: dict | None = None) -> Path:
+        cancel: threading.Event | None = None, tags: dict | None = None,
+        removed=()) -> Path:
     """Copy the stretch from start to end (seconds, already on keyframes) of the
-    chosen tracks into dest, a file of the same kind as the original. Written to
-    a temporary name first, so a stopped or failed cut never leaves half a file."""
+    chosen tracks into dest, a file of the same kind as the original, leaving out
+    any removed stretches (also on keyframes): what's left is joined seamlessly.
+    Written to a temporary name first, so a stopped or failed cut never leaves
+    half a file."""
     dest = Path(dest)
     tmp = dest.with_name(f"{dest.stem}.splicing{dest.suffix}")
-    abs_start, abs_end = start + info.origin, end + info.origin
-    to_end = end >= info.duration - EPS
+    kept = segments(start, end, removed)
+    if not kept:
+        raise SpliceError("Nothing is left of this part once the removed stretches are "
+                          "taken out.")
+    spans = [(s + info.origin, e + info.origin, e >= info.duration - EPS) for s, e in kept]
     try:
-        _write(info, abs_start, abs_end, to_end, set(tracks), tmp, title,
-               end - start, progress, cancel, tags or {})
+        _write(info, spans, set(tracks), tmp, title,
+               sum(e - s for s, e in kept), progress, cancel, tags or {})
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -362,8 +383,7 @@ def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
     return dest
 
 
-def _write(info, abs_start, abs_end, to_end, chosen, tmp, title, length, progress, cancel,
-           extra):
+def _write(info, spans, chosen, tmp, title, length, progress, cancel, extra):
     with _open(info.path) as source:
         streams = [s for s in source.streams if s.index in chosen]
         if not streams:
@@ -406,8 +426,7 @@ def _write(info, abs_start, abs_end, to_end, chosen, tmp, title, length, progres
                     pass
                 mapping[s.index] = o
 
-            _copy_packets(source, streams, mapping, output, abs_start, abs_end, to_end,
-                          length, progress, cancel)
+            _copy_packets(source, streams, mapping, output, spans, length, progress, cancel)
 
 
 def _attached_files(source, streams) -> list[tuple[str, str, bytes]]:
@@ -440,86 +459,106 @@ def _attached_files(source, streams) -> list[tuple[str, str, bytes]]:
     return found
 
 
-def _copy_packets(source, streams, mapping, output, abs_start, abs_end, to_end,
-                  length, progress, cancel):
+def _copy_packets(source, streams, mapping, output, spans, length, progress, cancel):
+    """Copy each stretch (absolute start, absolute end, runs to the file's end) in
+    turn, the next one's timestamps carrying on where the last one stopped."""
     kinds = {s.index: _kind(s) for s in source.streams}
-    offsets = {s.index: Fraction(abs_start) for s in streams}
-    # Picture and sound arrive steadily; a part is finished once each has passed the end
+    # Picture and sound arrive steadily; a stretch is done once each has passed its end
     steady = {s.index for s in streams if kinds[s.index] in ("video", "audio")}
-    finished: set[int] = set()
-    started: set[int] = set()     # video tracks that have reached their first keyframe
     covers_done: set[int] = set()
-
+    last_dts: dict[int, int] = {}
     # Start reading a little early when there are subtitles, to catch a line that's
-    # already on screen when the part begins
+    # already on screen when a stretch begins
     lookback = SUBTITLE_LOOKBACK if any(kinds[s.index] == "subtitle" for s in streams) else 0
-    source.seek(int(max(abs_start - lookback, 0) * av.time_base), backward=True)
+    written = Fraction(0)          # how much of the part is already copied
     last_report = -1.0
     try:
-        demuxer = source.demux()
-        for packet in demuxer:
-            if cancel is not None and cancel.is_set():
-                raise Cancelled
-            index = packet.stream.index
-            if packet.size == 0:
-                continue
-            kind = kinds.get(index)
-            if kind == "cover":
-                if index in mapping and index not in covers_done:
-                    covers_done.add(index)
-                    packet.pts = packet.dts = 0
-                    packet.stream = mapping[index]
-                    output.mux(packet)
-                continue
-            stamp = packet.pts if packet.pts is not None else packet.dts
-            if stamp is None:
-                continue
-            tb = packet.time_base
-            t = stamp * tb
-            float_t = float(t)
-            # Done once picture and sound are past the end; and give up waiting on a
-            # track that stops early
-            if not to_end and float_t >= abs_end + 2.0 and (steady <= finished or
-                                                           float_t >= abs_end + 30.0):
-                break
-            if index not in mapping:
-                continue
-            if kind == "video":
-                if index not in started:
-                    if not packet.is_keyframe or float_t < abs_start - EPS:
-                        continue
-                    started.add(index)
-                if not to_end and packet.is_keyframe and float_t >= abs_end - EPS:
-                    finished.add(index)
-                if index in finished or float_t < abs_start - EPS:
+        for abs_start, abs_end, to_end in spans:
+            start = Fraction(abs_start)
+            offset = start - written  # take this off a time to place it in the part
+            finished: set[int] = set()
+            started: set[int] = set()  # video tracks that have reached their first keyframe
+            source.seek(int(max(abs_start - lookback, 0) * av.time_base), backward=True)
+            for packet in source.demux():
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled
+                index = packet.stream.index
+                if packet.size == 0:
                     continue
-            else:
-                if not to_end and float_t >= abs_end - EPS:
-                    finished.add(index)
+                kind = kinds.get(index)
+                if kind == "cover":
+                    if index in mapping and index not in covers_done:
+                        covers_done.add(index)
+                        packet.pts = packet.dts = 0
+                        packet.stream = mapping[index]
+                        output.mux(packet)
                     continue
-                if float_t < abs_start - EPS:
-                    # A subtitle that's still on screen when the part begins
-                    if kind == "subtitle" and packet.duration and \
-                            float((stamp + packet.duration) * tb) > abs_start + EPS:
-                        cut_ticks = int(round(Fraction(abs_start) / tb))
-                        packet.duration = stamp + packet.duration - cut_ticks
-                        if packet.dts is not None:
-                            packet.dts = cut_ticks
-                        packet.pts = cut_ticks
-                    else:
+                stamp = packet.pts if packet.pts is not None else packet.dts
+                if stamp is None:
+                    continue
+                tb = packet.time_base
+                t = stamp * tb
+                float_t = float(t)
+                # Done once picture and sound are past the end; and give up waiting on
+                # a track that stops early
+                if not to_end and float_t >= abs_end + 2.0 and (steady <= finished or
+                                                               float_t >= abs_end + 30.0):
+                    break
+                if index not in mapping:
+                    continue
+                if kind == "video":
+                    if index not in started:
+                        if not packet.is_keyframe or float_t < abs_start - EPS:
+                            continue
+                        started.add(index)
+                    if not to_end and packet.is_keyframe and float_t >= abs_end - EPS:
+                        finished.add(index)
+                    if index in finished or float_t < abs_start - EPS:
                         continue
-            shift = int(round(offsets[index] / tb))
-            if packet.pts is not None:
-                packet.pts -= shift
-            if packet.dts is not None:
-                packet.dts -= shift
-            packet.stream = mapping[index]
-            output.mux(packet)
-            if progress and length > 0:
-                done = min(max((float_t - abs_start) / length, 0.0), 1.0)
-                if done - last_report >= 0.005:
-                    last_report = done
-                    progress(done)
+                else:
+                    if not to_end and float_t >= abs_end - EPS:
+                        finished.add(index)
+                        continue
+                    if float_t < abs_start - EPS:
+                        # A subtitle that's still on screen when the stretch begins
+                        if kind == "subtitle" and packet.duration and \
+                                float((stamp + packet.duration) * tb) > abs_start + EPS:
+                            cut_ticks = int(round(start / tb))
+                            packet.duration = stamp + packet.duration - cut_ticks
+                            if packet.dts is not None:
+                                packet.dts = cut_ticks
+                            packet.pts = cut_ticks
+                        else:
+                            continue
+                shift = int(round(offset / tb))
+                if packet.pts is not None:
+                    packet.pts -= shift
+                if packet.dts is not None:
+                    packet.dts -= shift
+                elif index in last_dts and kind == "video":
+                    # Matroska often leaves it out after a jump; at a join the muxer
+                    # would guess it wrong, so carry on from the last one
+                    packet.dts = last_dts[index] + max(packet.duration or 1, 1)
+                if packet.dts is not None:
+                    # Where two stretches meet, never let decoding time go backwards
+                    if index in last_dts and packet.dts <= last_dts[index]:
+                        packet.dts = last_dts[index] + 1
+                        if packet.pts is not None and packet.pts < packet.dts:
+                            packet.pts = packet.dts
+                    last_dts[index] = packet.dts
+                if kind == "subtitle" and packet.duration and packet.pts is not None                         and not to_end:
+                    # A line on screen when the stretch ends stops there
+                    stop = int(round((Fraction(abs_end) - offset) / tb))
+                    if packet.pts + packet.duration > stop:
+                        packet.duration = max(stop - packet.pts, 1)
+                packet.stream = mapping[index]
+                output.mux(packet)
+                if progress and length > 0:
+                    done = min(max(float(written + t - start) / length, 0.0), 1.0)
+                    if done - last_report >= 0.005:
+                        last_report = done
+                        progress(done)
+            written += Fraction(abs_end) - start
     except av.FFmpegError as e:
         raise SpliceError(f"Copying failed: {e}") from None
     if progress:

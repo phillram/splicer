@@ -64,8 +64,11 @@ Otherwise there's one part covering the whole video, called *Part 1*.
 - **Add part** fills the gap after the selected part, or the gap after the last
   part. If the whole video is already covered, it adds a copy of the selected
   part for you to change.
-- **Split** cuts the selected part in two at the playhead (or near its middle,
-  if the playhead isn't inside it).
+- **Split** cuts the selected part in two at the current time (or near its
+  middle, if the current time isn't inside it).
+- **Join** makes the selected parts (Ctrl+click or Shift+click them in the
+  list) into one part, saved as one file: see [Leaving stretches out and
+  joining parts](#leaving-stretches-out-and-joining-parts).
 - **Remove** (or Delete) removes the selected parts.
 - **↶** and **↷** undo and redo any change to the parts (Ctrl+Z, Ctrl+Y).
 - **More**:
@@ -89,8 +92,8 @@ Select a part to edit it below the list:
   as `1:02:03.5`, `4:38`, `4:38.250` or `278.25`.
 - **◀** and **▶** (or the Up and Down keys in a time box) move to the cut point
   before or after.
-- **Set to playhead** (I and O) starts the part at the frame in the player, or
-  ends it just after that frame.
+- **Use current time** (I and O) starts the part at the picture showing in the
+  player, or ends it just after that picture.
 
 Or drag the edge of a part along the **Timeline**.
 
@@ -100,11 +103,40 @@ With **Keep touching parts joined** checked, moving a cut that two parts share
 After each change the player shows the part's new first frame, or its new
 last frame, so you can see exactly where it cuts.
 
+### Leaving stretches out and joining parts
+
+A part doesn't have to be one unbroken stretch of the video. Its file can
+leave bits out, with what's either side joined seamlessly, still losslessly.
+
+To take a stretch out of the middle of a part (say 3:41 to 4:22, without the
+three seconds around 4:01):
+
+1. Select the part and set its start and end.
+2. Go to the stretch you don't want in the player and press **Cut out a
+   section**. A stretch of about three seconds from there is left out.
+3. Change its times in the **Leaves out** row that appears (type them, use
+   Up and Down, or press **Now** to use the current time), or drag its edges
+   on the timeline, where it shows as a dark "left out" block.
+4. Press **Play** a little before it to watch the join: the player jumps
+   straight over it, as the saved file will.
+
+**Put back** keeps that stretch after all. A part can leave out as many
+stretches as you like, and its **Length** is the length of its file.
+
+To make one file from separate bits of the video, pick their parts in the list
+(Ctrl+click or Shift+click) and press **Join**: they become one part, with
+everything between them left out.
+
+A stretch left out starts and ends on keyframes too, so it can't be any length
+you like: in a video with a keyframe every three seconds or so, it's three
+seconds, or six, and so on. When you change it, it moves to the nearest
+keyframes, and the timeline shows them once you zoom in.
+
 #### Why times move a little
 
 A video can only be cut without re-encoding at a **keyframe**, a frame that
 doesn't depend on the ones before it. Most videos have one every 1 to 10
-seconds. Chapter times, typed times, timestamps and playhead times all move to
+seconds. Chapter times, typed times, timestamps and current times all move to
 the nearest keyframe; when a time you gave moves, the status line at the bottom
 says where to. The times in the list are always exactly where the cuts will be.
 
@@ -118,7 +150,7 @@ Files with sound and no picture can be cut anywhere.
 Selecting a part takes the player to its start. Under the picture:
 
 - The **bar** shows the whole video, with the parts on it. Click or drag
-  anywhere to go there. The outline shows the stretch the Timeline is showing.
+  anywhere to jump there. The outline shows the stretch the Timeline is showing.
 - **⏮** goes to the part's first frame and **⏭** to its last.
 - **⏪** and **⏩** go back or forward 5 seconds.
 - **▶** plays and **⏸** pauses. Clicking the picture does the same.
@@ -137,7 +169,8 @@ Selecting a part takes the player to its start. Under the picture:
 - **Full screen** (or double-clicking the picture) fills the screen. Its
   controls show when you move the mouse. Esc or double-click leaves.
 
-Above the picture is where the playhead is within the selected part.
+Above the picture is how far into the selected part's file the current time
+is (stretches left out don't count).
 
 If the picture can't keep up (a 4K video on a slower PC), the player skips
 frames rather than let the sound stutter.
@@ -148,13 +181,14 @@ The timeline along the bottom shows the video with a time ruler, every part
 with its name and length, the original chapters as orange marks and, once
 you've zoomed in far enough, every keyframe: the only places a cut can go.
 
-- **Drag the edge of a part** to move that cut. It jumps from keyframe to
-  keyframe, and the player shows the frame there as you drag.
-- **Click or drag** anywhere else to move the playhead.
+- **Drag the edge of a part**, or of a stretch left out of one, to move that
+  cut. It jumps from keyframe to keyframe, and the player shows the frame
+  there as you drag.
+- **Click or drag** anywhere else to jump there.
 - **Double-click** a part to select it.
 - **Ctrl+wheel** zooms in and out around the pointer, and the **wheel** scrolls.
   The buttons zoom too: **−**, **+**, **Part** (the selected part) and **Whole
-  video**. While playing, the timeline follows the playhead.
+  video**. While playing, the timeline follows along.
 
 ### Keyboard
 
@@ -166,7 +200,7 @@ you've zoomed in far enough, every keyframe: the only places a cut can go.
 | Ctrl+← Ctrl+→ | The keyframe before / after |
 | Home End | The part's first / last frame |
 | Page Up, Page Down | The previous / next part |
-| I O | Start / end the part here |
+| I O | Start / end the part at the current time |
 | Ctrl+Z, Ctrl+Y | Undo / redo |
 | + − | Zoom the timeline in / out |
 | S | Save the frame as a picture |

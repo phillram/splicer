@@ -13,7 +13,7 @@ import shutil
 import sys
 import threading
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, ttk
 
@@ -58,7 +58,7 @@ SHORTCUTS = """Space  play / pause
 Ctrl+←  Ctrl+→  keyframe before / after
 Home  End  start / last frame of the part
 Page Up  Page Down  previous / next part
-I  O  set the part's start / end here
+I  O  start / end the part at the current time
 Ctrl+Z  Ctrl+Y  undo / redo
 +  −  zoom the timeline in / out
 S  save the frame as a picture
@@ -72,11 +72,40 @@ class Part:
     start: float
     end: float
     use: bool = True
+    removed: list = field(default_factory=list)  # [[from, to], …] left out of the middle
     iid: str = ""
 
     @property
+    def kept(self) -> list[tuple[float, float]]:
+        return engine.segments(self.start, self.end, self.removed)
+
+    @property
     def length(self) -> float:
-        return max(self.end - self.start, 0.0)
+        """How long the part's file will be: removed stretches don't count."""
+        return sum(e - s for s, e in self.kept)
+
+    def into(self, t: float) -> float:
+        """How far t is into the part's file."""
+        return sum(min(max(t - s, 0.0), e - s) for s, e in self.kept) + min(t - self.start, 0)
+
+
+def tidy_removed(part: Part) -> None:
+    """Removed stretches inside the part, in order, not overlapping. One that reaches
+    an end of the part just moves that end in."""
+    stretches = sorted([max(r0, part.start), min(r1, part.end)] for r0, r1 in part.removed)
+    merged: list[list[float]] = []
+    for r0, r1 in stretches:
+        if r1 - r0 <= EPS:
+            continue
+        if merged and r0 <= merged[-1][1] + EPS:
+            merged[-1][1] = max(merged[-1][1], r1)
+        else:
+            merged.append([r0, r1])
+    while merged and merged[0][0] <= part.start + EPS and merged[0][1] < part.end - EPS:
+        part.start = merged.pop(0)[1]
+    while merged and merged[-1][1] >= part.end - EPS and merged[-1][0] > part.start + EPS:
+        part.end = merged.pop()[0]
+    part.removed = merged
 
 
 # --- Small helpers, as in Leveler --------------------------------------------------
@@ -659,14 +688,19 @@ class App(BaseTk):
         for text, command, help_text in (
                 ("Remove", self._remove_parts, "Remove the selected parts (Delete)."),
                 ("Split", self._split_part,
-                 "Cut the selected part in two: at the playhead if it's inside the part, "
-                 "otherwise near its middle."),
+                 "Cut the selected part in two at the current time (or near its middle, "
+                 "if the current time isn't inside it)."),
+                ("Join", self._join_parts,
+                 "Join the selected parts (Ctrl+click or Shift+click to pick them) into one "
+                 "part, saved as one file. Whatever lies between them is left out."),
                 ("Add part", self._add_part,
                  "Add a part in the gap after the selected one."),
         ):
             b = tip(ttk.Button(head, text=text, command=command), help_text)
             b.pack(side="right", padx=(4, 0))
             self.part_buttons.append(b)
+            if text == "Join":
+                self.join_btn = b
 
         # The selected part, under the list; the list gives way when space is short
         edit = ttk.Frame(box, style="Tab.TFrame", padding=(0, 8, 0, 0))
@@ -722,12 +756,12 @@ class App(BaseTk):
                                      command=lambda s=side: self._step_cut(s, 1)),
                           "Move to the keyframe after.")
             forward.pack(side="left")
-            here = tip(ttk.Button(line, text="Set to playhead",
+            here = tip(ttk.Button(line, text="Use current time",
                                   command=lambda s=side: self._cut_here(s)),
-                       ("Start the part at the frame in the player (I), or the keyframe "
-                        "nearest it." if side == "start" else
-                        "End the part after the frame in the player (O), or at the keyframe "
-                        "nearest that."))
+                       ("Start the part at the picture showing in the player (I), or at the "
+                        "keyframe nearest it." if side == "start" else
+                        "End the part just after the picture showing in the player (O), or "
+                        "at the keyframe nearest that."))
             here.pack(side="left", padx=(8, 0))
             note = ttk.Label(line, text="", style="TabNote.TLabel")
             note.pack(side="left", padx=(8, 0))
@@ -735,11 +769,22 @@ class App(BaseTk):
             self.edit_widgets += [back, entry, forward, here]
         self.length_label = ttk.Label(edit, text="", style="TabNote.TLabel")
         self.length_label.grid(row=3, column=1, sticky="w", pady=(2, 0))
+        cut_row = ttk.Frame(edit, style="Tab.TFrame")
+        cut_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.cut_btn = tip(ttk.Button(cut_row, text="Cut out a section", command=self.cut_out),
+                           "Leave a stretch out of the middle of this part; what's either "
+                           "side of it is joined into one file, still losslessly. It starts "
+                           "at the current time: change its times below, or drag its edges "
+                           "on the timeline.")
+        self.cut_btn.pack(side="left")
+        self.edit_widgets.append(self.cut_btn)
+        self.removed_box = ttk.Frame(edit, style="Tab.TFrame")
+        self.removed_box.grid(row=5, column=0, columnspan=2, sticky="ew")
         self.joined_var = tk.BooleanVar(value=self.settings.get("joined", True))
         tip(ttk.Checkbutton(edit, text="Keep touching parts joined", variable=self.joined_var,
                             style="Tab.TCheckbutton"),
             "When a part ends where the next one starts, moving that cut moves both, so "
-            "nothing falls between them.").grid(row=4, column=0, columnspan=2, sticky="w",
+            "nothing falls between them.").grid(row=6, column=0, columnspan=2, sticky="w",
                                                 pady=(8, 0))
 
     def _build_player(self, box):
@@ -787,21 +832,8 @@ class App(BaseTk):
             self.transport.append(b)
         self.time_label = ttk.Label(row, text="", style="Time.TLabel")
         self.time_label.pack(side="left", padx=(12, 0))
-        self.full_btn = tip(ttk.Button(row, text="⛶  Full screen",
-                                       command=self.enter_full_screen),
-                            "Watch full screen (F, or double-click the picture). Esc leaves.")
-        self.full_btn.pack(side="right")
-
         row = ttk.Frame(controls)
         row.pack(fill="x", pady=(6, 0))
-        # The volume gets its room first; the rest shares what's left
-        self.volume_var = tk.DoubleVar(value=self.settings.get("volume", 80))
-        volume = ttk.Scale(row, from_=0, to=100, variable=self.volume_var, length=110,
-                           command=lambda v: self.player.set_volume(self._volume()))
-        volume.pack(side="right")
-        self.mute_btn = tip(ttk.Button(row, text="🔊", style="Transport.TButton",
-                                       command=self.toggle_mute), "Mute (M)")
-        self.mute_btn.pack(side="right", padx=(0, 4))
         ttk.Label(row, text="At the end of the part").pack(side="left")
         self.end_mode = self.settings.get("end_mode", "stop")
         if self.end_mode not in END_MODES:
@@ -821,16 +853,30 @@ class App(BaseTk):
         self.subtitle_box.bind("<<ComboboxSelected>>", lambda e: self._subtitles_changed())
         tip(self.subtitle_box, "Subtitles to show in the player. Only text subtitles can be "
             "shown here; every checked subtitle track goes into the parts either way.")
+
+        row = ttk.Frame(controls)
+        row.pack(fill="x", pady=(6, 0))
         self.frame_btn = tip(ttk.Button(row, text="Save frame", command=self.save_frame),
                              "Save the picture in the player, at full size, as a PNG in the "
                              "folder the parts go to (S).")
-        self.frame_btn.pack(side="left", padx=(14, 0))
+        self.frame_btn.pack(side="left")
+        self.full_btn = tip(ttk.Button(row, text="⛶  Full screen",
+                                       command=self.enter_full_screen),
+                            "Watch full screen (F, or double-click the picture). Esc leaves.")
+        self.full_btn.pack(side="left", padx=(6, 0))
+        self.volume_var = tk.DoubleVar(value=self.settings.get("volume", 80))
+        volume = ttk.Scale(row, from_=0, to=100, variable=self.volume_var, length=110,
+                           command=lambda v: self.player.set_volume(self._volume()))
+        volume.pack(side="right")
+        self.mute_btn = tip(ttk.Button(row, text="🔊", style="Transport.TButton",
+                                       command=self.toggle_mute), "Mute (M)")
+        self.mute_btn.pack(side="right", padx=(0, 4))
 
     def _build_timeline(self, box):
         head = ttk.Frame(box)
         head.pack(fill="x")
         ttk.Label(head, text="Timeline", style="Section.TLabel").pack(side="left")
-        ttk.Label(head, text="Drag a cut to move it  ·  click to move the playhead  ·  "
+        ttk.Label(head, text="Drag a cut to move it  ·  click to jump there  ·  "
                   "Ctrl+wheel zooms, wheel scrolls", style="Note.TLabel"
                   ).pack(side="left", padx=(10, 0))
         self.zoom_buttons = []
@@ -1022,11 +1068,13 @@ class App(BaseTk):
             return False
         parts = []
         try:
-            for title, start, end, use in data["parts"]:
+            for title, start, end, use, *more in data["parts"]:
                 start, end = float(start), float(end)
                 if not (0 <= start < end <= self.info.duration + 0.01):
                     return False
-                parts.append(Part(str(title), start, min(end, self.info.duration), bool(use)))
+                removed = [[float(a), float(b)] for a, b in (more[0] if more else [])]
+                parts.append(Part(str(title), start, min(end, self.info.duration), bool(use),
+                                  removed))
             for index, on in (data.get("tracks") or {}).items():
                 if int(index) in self.track_use:
                     self.track_use[int(index)] = bool(on)
@@ -1052,7 +1100,7 @@ class App(BaseTk):
         if not self.info:
             return
         projects.save(self.info.path, {
-            "parts": [[p.title, p.start, p.end, p.use] for p in self.parts],
+            "parts": [[p.title, p.start, p.end, p.use, p.removed] for p in self.parts],
             "tracks": {str(k): v for k, v in self.track_use.items()},
         })
 
@@ -1119,7 +1167,8 @@ class App(BaseTk):
     # --- Undo ---
 
     def _snapshot(self):
-        return [(p.title, p.start, p.end, p.use) for p in self.parts]
+        return [(p.title, p.start, p.end, p.use, [list(r) for r in p.removed])
+                for p in self.parts]
 
     def _remember(self, kind=None):
         """Call before changing the parts."""
@@ -1133,7 +1182,7 @@ class App(BaseTk):
     def _back_to(self, snapshot):
         current = self._current()
         index = self.parts.index(current) if current in self.parts else 0
-        self.parts = [Part(*s) for s in snapshot]
+        self.parts = [Part(t, s, e, u, [list(r) for r in rm]) for t, s, e, u, rm in snapshot]
         self.last_edit = None
         self.shown_part = None
         self._refresh_parts()
@@ -1184,6 +1233,8 @@ class App(BaseTk):
             self._project_changed()
 
     def _sorted(self):
+        for part in self.parts:
+            tidy_removed(part)
         self.parts.sort(key=lambda p: (p.start, p.end))
         # Names Splicer made up ("Part 3") follow the order; names you typed don't change
         for n, part in enumerate(self.parts, 1):
@@ -1325,12 +1376,165 @@ class App(BaseTk):
                 self.bell()
                 return
             at = min(keys, key=lambda k: abs(k - (part.start + part.end) / 2))
+        for r0, r1 in part.removed:  # never split inside a stretch that's left out
+            if r0 - EPS < at < r1 + EPS:
+                at = r1 if r1 < part.end - EPS else r0
+        if not inside(at):
+            self.bell()
+            return
         self._remember()
         title = "Part 0" if DEFAULT_NAME.fullmatch(part.title) else f"{part.title} (2)"
-        second = Part(title, at, part.end, part.use)
+        second = Part(title, at, part.end, part.use,
+                      [list(r) for r in part.removed if r[0] >= at - EPS])
+        part.removed = [r for r in part.removed if r[1] <= at + EPS]
         part.end = at
         self.parts.append(second)
         self._changed(select=second)
+
+    def _join_parts(self):
+        chosen = self._selected_parts()
+        if self.busy or not self.info:
+            return
+        if len(chosen) < 2:
+            self.status.configure(text="Pick two or more parts to join: Ctrl+click or "
+                                       "Shift+click them in the list.")
+            self.bell()
+            return
+        spans = sorted(seg for p in chosen for seg in p.kept)
+        merged: list[list[float]] = []
+        for a, b in spans:
+            if merged and a <= merged[-1][1] + EPS:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        self._remember()
+        joined = Part(chosen[0].title, merged[0][0], merged[-1][1], True,
+                      [[a[1], b[0]] for a, b in zip(merged, merged[1:])])
+        self.parts = [p for p in self.parts if p not in chosen] + [joined]
+        self.shown_part = None
+        self._changed(select=joined)
+        gaps = len(joined.removed)
+        self.status.configure(
+            text=f"Joined {len(chosen)} parts into one, {fmt_time(joined.length)} long"
+                 + (f"; {gaps} stretch{'es' * (gaps != 1)} between them left out."
+                    if gaps else ".") + " Ctrl+Z undoes that.")
+
+    # --- Stretches left out of a part ---
+
+    def cut_out(self):
+        info, part = self.info, self._current()
+        if not info or not part or self.busy:
+            return
+        inside = lambda t: part.start + EPS < t < part.end - EPS  # noqa: E731
+        at = engine.snap(info, self.position)
+        if not inside(at):
+            at = engine.snap(info, (part.start + part.end) / 2)
+        if not inside(at):
+            at = engine.next_keyframe(info, part.start)
+        end = next((k for k in info.keyframes if k >= at + 2.5 - EPS), None)
+        if end is None or not end < part.end - EPS:
+            end = engine.next_keyframe(info, at)
+        if not (inside(at) and inside(end) and end > at + EPS):
+            self.status.configure(text="This part is too short to cut a section out of: "
+                                       "there aren't keyframes enough inside it.")
+            self.bell()
+            return
+        self._remember()
+        part.removed.append([at, end])
+        self.shown_part = part
+        self._changed(select=part)
+        self.player.seek(max(at - 2.0, part.start), pause=True)
+        self.status.configure(
+            text=f"Left out {fmt_time(at)} to {fmt_time(end)} ({end - at:.2f} s). Change its "
+                 "times below or drag its edges on the timeline; play across it to see the "
+                 "join.")
+
+    def move_removed(self, part: Part, i: int, edge: int, t: float):
+        """Move one edge (0: from, 1: to) of a stretch left out of a part."""
+        if part not in self.parts or i >= len(part.removed):
+            return
+        stretch = list(part.removed[i])
+        stretch[edge] = min(max(t, part.start), part.end)
+        if stretch[1] - stretch[0] <= EPS:
+            self.status.configure(text="A stretch left out has to end after it starts.")
+            self.bell()
+            self._fill_removed(part)
+            return
+        if abs(stretch[edge] - part.removed[i][edge]) <= EPS:
+            self._fill_removed(part)
+            return
+        self._remember()
+        part.removed[i] = stretch
+        self.shown_part = part
+        self._changed(select=part)
+        # Show the join: the last picture before the stretch, or the first after it
+        if edge == 0:
+            self.player.seek(stretch[0] - self.player.frame_duration, pause=True)
+        else:
+            self.player.seek(stretch[1], pause=True)
+
+    def put_back(self, part: Part, i: int):
+        if part in self.parts and i < len(part.removed):
+            self._remember()
+            del part.removed[i]
+            self.shown_part = part
+            self._changed(select=part)
+
+    def _fill_removed(self, part: Part | None):
+        box = self.removed_box
+        for child in box.winfo_children():
+            child.destroy()
+        if not part:
+            return
+        for i, (r0, r1) in enumerate(part.removed):
+            row = ttk.Frame(box, style="Tab.TFrame")
+            row.pack(anchor="w", pady=(4, 0))
+            ttk.Label(row, text="Leaves out", style="Tab.TLabel").pack(side="left")
+            for edge, value in ((0, r0), (1, r1)):
+                if edge:
+                    ttk.Label(row, text="to", style="Tab.TLabel").pack(side="left", padx=4)
+                var = tk.StringVar(value=fmt_time(value))
+                entry = ttk.Entry(row, textvariable=var, width=11, justify="center")
+                entry.pack(side="left", padx=(6 if not edge else 0, 2))
+                commit = lambda e, i=i, edge=edge, var=var: self._commit_removed(  # noqa: E731
+                    part, i, edge, var)
+                for key in ("<Return>", "<KP_Enter>", "<FocusOut>"):
+                    entry.bind(key, commit)
+                entry.bind("<Up>", lambda e, i=i, edge=edge: self._step_removed(part, i, edge, 1))
+                entry.bind("<Down>",
+                           lambda e, i=i, edge=edge: self._step_removed(part, i, edge, -1))
+                tip(entry, "Type a time and press Enter; Up and Down step between keyframes. "
+                    "Like every cut, it sits on a keyframe.")
+                tip(ttk.Button(row, text="Now", style="Step.TButton",
+                               command=lambda i=i, edge=edge: self.move_removed(
+                                   part, i, edge, engine.snap(self.info, self.position))),
+                    "Use the current time in the player.").pack(side="left")
+            ttk.Label(row, text=f"({r1 - r0:.2f} s)", style="TabNote.TLabel"
+                      ).pack(side="left", padx=6)
+            tip(ttk.Button(row, text="Put back", command=lambda i=i: self.put_back(part, i)),
+                "Keep this stretch in the part after all.").pack(side="left")
+
+    def _commit_removed(self, part: Part, i: int, edge: int, var: tk.StringVar):
+        if part not in self.parts or i >= len(part.removed) or self.busy:
+            return
+        text = var.get()
+        if text == fmt_time(part.removed[i][edge]):
+            return
+        t = parse_time(text)
+        if t is None:
+            self.status.configure(text=f"“{text}” isn't a time. Try 4:38, 4:38.25 or 1:02:03.")
+            var.set(fmt_time(part.removed[i][edge]))
+            self.bell()
+            return
+        self.move_removed(part, i, edge, engine.snap(self.info, t))
+
+    def _step_removed(self, part: Part, i: int, edge: int, direction: int):
+        if part in self.parts and i < len(part.removed):
+            now = part.removed[i][edge]
+            t = engine.next_keyframe(self.info, now) if direction > 0 \
+                else engine.previous_keyframe(self.info, now)
+            self.move_removed(part, i, edge, t)
+        return "break"
 
     def _remove_parts(self):
         chosen = self._selected_parts()
@@ -1397,6 +1601,7 @@ class App(BaseTk):
                 self.time_vars[side].set("")
                 self.side_notes[side].configure(text="")
             self.length_label.configure(text="")
+            self._fill_removed(None)
             self.player.set_range(None, None)
             self.shown_part = None
             self._draw_timelines()
@@ -1408,12 +1613,17 @@ class App(BaseTk):
             self._filling = False
         for side in ("start", "end"):
             self.time_vars[side].set(fmt_time(getattr(part, side)))
-        self.length_label.configure(text=f"Length {fmt_time(part.length)}")
+        gaps = len(part.removed)
+        self.length_label.configure(
+            text=f"Length {fmt_time(part.length)}" + (
+                f"  ({gaps} stretch{'es' * (gaps != 1)} left out, the rest joined)"
+                if gaps else ""))
+        self._fill_removed(part)
         self.side_notes["start"].configure(
             text="the start of the video" if part.start <= EPS else "")
         self.side_notes["end"].configure(
             text="the end of the video" if part.end >= self.info.duration - EPS else "")
-        self.player.set_range(part.start, part.end)
+        self.player.set_range(part.start, part.end, [tuple(r) for r in part.removed])
         if part is not self.shown_part:
             self.shown_part = part
             self.player.seek(part.start)  # carries on playing if it was
@@ -1642,7 +1852,7 @@ class App(BaseTk):
         self.time_label.configure(text=text)
         part = self._current() if info else None
         if part:
-            into = self.position - part.start
+            into = part.into(self.position)
             self.part_time.configure(
                 text=f"{part.title}:  {'-' if into < 0 else ''}{fmt_time(abs(into))}  of  "
                      f"{fmt_time(part.length)}")
@@ -1756,19 +1966,18 @@ class App(BaseTk):
         album = info.path.stem
         jobs = [(p.title, p.start, p.end, dest,
                  {"track": f"{n}/{len(jobs)}", "album": album}
-                 if self.save_as == "sound" else {})
+                 if self.save_as == "sound" else {}, [tuple(r) for r in p.removed], p.length)
                 for n, (p, dest) in enumerate(jobs, 1)]
 
         def work():
             done_length, written, failed = 0.0, [], []
-            for n, (title, start, end, dest, tags) in enumerate(jobs, 1):
-                length = end - start
+            for n, (title, start, end, dest, tags, removed, length) in enumerate(jobs, 1):
                 self.events.put(("part", n, len(jobs), dest.name))
                 try:
                     engine.cut(info, start, end, tracks, dest, title,
                                lambda f, base=done_length, length=length: self.events.put(
                                    ("progress", (base + f * length) / max(total, 1e-9))),
-                               self.cancel, tags=tags)
+                               self.cancel, tags=tags, removed=removed)
                     written.append(dest)
                 except engine.Cancelled:
                     self.events.put(("spliced", written, failed, True))
@@ -1820,6 +2029,7 @@ class App(BaseTk):
 
         for b in self.part_buttons:
             state(b, idle and loaded)
+        state(self.join_btn, idle and loaded and len(self._selected_parts()) > 1)
         state(self.undo_btn, idle and loaded and bool(self.undo))
         state(self.redo_btn, idle and loaded and bool(self.redo))
         for w in self.edit_widgets:

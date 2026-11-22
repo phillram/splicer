@@ -501,8 +501,10 @@ class Player:
         """One frame forward (1) or back (-1), paused."""
         self.commands.put(("step", frames))
 
-    def set_range(self, start: float | None, end: float | None):
-        self.commands.put(("range", start, end))
+    def set_range(self, start: float | None, end: float | None, removed=()):
+        """The selected part: where it starts and ends, and the stretches left out
+        of it, which playing jumps over."""
+        self.commands.put(("range", start, end, tuple(removed)))
 
     def set_end_mode(self, mode: str):
         """What happens at the end of the part: "stop", "loop" or "continue"."""
@@ -541,6 +543,7 @@ class Player:
         self.origin = self.duration = 0.0
         self.audio_index = None
         self.range = (None, None)
+        self.removed: tuple = ()
         self.mode = "stop"
         self.cues: list[Cue] = []
         self.cue_starts: list[float] = []
@@ -614,6 +617,7 @@ class Player:
             self.mode = command[1]
         elif kind == "range":
             self.range = (command[1], command[2])
+            self.removed = command[3]
         elif kind == "subtitles":
             self.cues = command[1]
             self.cue_starts = [c.start for c in self.cues]
@@ -894,6 +898,13 @@ class Player:
                 self._halt()
                 self._seek(end - self.frame_duration, exact=True)
             return
+        if start is not None:
+            for r0, r1 in self.removed:  # jump over a stretch left out of the part
+                if r0 - EPS <= now < r1 - EPS:
+                    self._end_session()
+                    self._seek(r1, exact=True)
+                    self._play()
+                    return
         due = None
         with self.ready:
             while self.frames_ready and self.frames_ready[0][0] <= now:
