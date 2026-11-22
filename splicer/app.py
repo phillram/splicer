@@ -315,8 +315,11 @@ class ImportDialog(tk.Toplevel):
         self.bind("<Map>", lambda e: e.widget is self and dark_title_bar(self), add=True)
         box = ttk.Frame(self, padding=12)
         box.pack(fill="both", expand=True)
-        ttk.Label(box, text=source, style="Note.TLabel", wraplength=int(600 * app.scale),
-                  justify="left").pack(anchor="w")
+        words = ttk.Label(box, text=source, style="Note.TLabel", justify="left")
+        words.pack(anchor="w", fill="x")
+        words.bind("<Configure>", lambda e: words.configure(wraplength=max(e.width - 4, 100)))
+        row = ttk.Frame(box)
+        row.pack(side="bottom", fill="x")  # before the text box, so it never pushes them off
         holder = ttk.Frame(box)
         holder.pack(fill="both", expand=True, pady=8)
         self.text = tk.Text(holder, bg=FIELD, fg=FG, insertbackground=FG, relief="flat",
@@ -328,8 +331,6 @@ class ImportDialog(tk.Toplevel):
         scroll.pack(side="left", fill="y")
         self.text.insert("1.0", text)
         self.text.bind("<<Modified>>", self._changed)
-        row = ttk.Frame(box)
-        row.pack(fill="x")
         self.found_label = ttk.Label(row, text="", style="Muted.TLabel")
         self.found_label.pack(side="left")
         ttk.Button(row, text="Make parts", style="Accent.TButton",
@@ -687,8 +688,8 @@ class App(BaseTk):
     def _build_parts(self, box):
         head = ttk.Frame(box, style="Tab.TFrame")
         head.pack(fill="x")
-        self.parts_note = ttk.Label(head, text="", style="TabNote.TLabel")
-        self.parts_note.pack(side="left")
+        self.parts_note = ttk.Label(head, text="", style="TabNote.TLabel")  # not shown: the
+        # count and total are in the tab's name, which leaves the buttons their room
         self.part_buttons = []
         self.more_menu = tk.Menu(self, tearoff=False)
         self.more_menu.add_command(label="Parts from timestamps…", command=self.open_import)
@@ -791,7 +792,9 @@ class App(BaseTk):
             self.time_vars[side], self.side_notes[side] = var, note
             self.edit_widgets += [back, entry, forward, here]
         self.length_label = ttk.Label(edit, text="", style="TabNote.TLabel")
-        self.length_label.grid(row=3, column=1, sticky="w", pady=(2, 0))
+        self.length_label.grid(row=3, column=1, sticky="ew", pady=(2, 0))
+        self.length_label.bind("<Configure>", lambda e: self.length_label.configure(
+            wraplength=max(e.width - 4, 100)))
         cut_row = ttk.Frame(edit, style="Tab.TFrame")
         cut_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.cut_btn = tip(ttk.Button(cut_row, text="Cut out a section", command=self.cut_out),
@@ -1376,7 +1379,8 @@ class App(BaseTk):
             total = sum(p.length for p in used)
             self.parts_note.configure(text=f"{len(used)} of {len(self.parts)} checked  ·  "
                                            f"{fmt_time(total).rsplit('.', 1)[0]} in all")
-            self.tabs.tab(0, text=f"Parts  {len(used)} of {len(self.parts)}")
+            self.tabs.tab(0, text=f"Parts  {len(used)} of {len(self.parts)}  ·  "
+                                  f"{fmt_time(total).rsplit('.', 1)[0]}")
         else:
             self.parts_note.configure(text="")
             self.tabs.tab(0, text="Parts")
@@ -1722,7 +1726,7 @@ class App(BaseTk):
             except tk.TclError:
                 clip = ""
             text = clip if len(timestamps.parse(clip)) >= 2 else ""
-            source = ("Paste a list of times, one per line, like “4:38 Zelda's Lullaby” (as "
+            source = ("Paste a list of times, one per line, like “4:38 Second song” (as "
                       "in video descriptions), then press Make parts. Your current parts are "
                       "replaced (Ctrl+Z brings them back).")
         ImportDialog(self, text, source)
