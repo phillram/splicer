@@ -1,6 +1,8 @@
 # Splicer
 
-Cut a video into parts, losslessly. Windows only.
+Cut a video into parts, losslessly. Open a video, and its chapters are already
+there as parts; tune them while you watch, then press **Splice** and each part
+is written to its own file.
 
 Out of the box, Splicer never re-encodes anything. Every frame of picture,
 every bit of sound and every subtitle in a part is an exact copy of the
@@ -9,14 +11,35 @@ seconds, even from a 4K video. If you'd rather cut on any frame, it can
 re-encode just the second or two of picture next to each cut, and nothing else:
 see [Where cuts can go](#where-cuts-can-go).
 
-Splicer never goes online. Everything it does happens on your PC.
+- Chapters become parts, named after them; or make parts from a list of
+  timestamps, like the ones in video descriptions
+- Picks the default sound and subtitle tracks; choose any others
+- Built-in player with sound and subtitles, full screen, and a zoomable
+  timeline where you drag the cuts
+- Leave stretches out of a part, or join parts, into one seamless file
+- Save the sound alone, untouched: the songs out of a music video
+- Undo and redo; remembers your parts for each video
 
-## Install
+Windows only. Dark themed. Splicer never goes online: everything it does
+happens on your PC.
 
-Run `Splicer.exe`. It's a single file and needs nothing else installed.
+## Getting it running
+
+Download `Splicer.exe` from the
+[latest release](https://github.com/phillram/splicer/releases/latest). It's a
+single file and needs nothing else installed: the video libraries it uses
+(FFmpeg's, through PyAV) are inside it.
 
 You can also drop a video onto `Splicer.exe`, or use **Open with**, to open it
-straight away.
+straight away. Splicer keeps its settings, and the parts it remembers for each
+video, in `%APPDATA%\Splicer`.
+
+From source, Python 3.10 or newer:
+
+```
+python -m pip install -r requirements.txt
+python -m splicer
+```
 
 ## Splitting a video
 
@@ -267,13 +290,13 @@ checks there's room on the drive first.
 **Cancel** stops splicing after removing the part being written; finished parts
 stay. **Open folder** shows the parts when it's done.
 
-## Building from source
+## Building Splicer.exe
 
 ```
 python -m pip install -r requirements.txt pyinstaller
-python -m splicer                 # run it
-python tools/build_exe.py         # make Splicer.exe
-python -m pytest tests            # check it
+python tools/build_exe.py         # makes Splicer.exe, beside this README
+python -m pip install pytest
+python -m pytest tests            # checks it
 ```
 
 `tools/make_icon.py` redraws the icon (needs Pillow).
