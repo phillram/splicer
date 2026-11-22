@@ -17,10 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, ttk
 
-from splicer import __version__, engine
+from splicer import __version__, engine, projects, timestamps
 from splicer.engine import EPS, Info
 from splicer.paths import DATA_DIR, ICON, SETTINGS_FILE
 from splicer.player import Player
+from splicer.timeline import Overview, Timeline
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -31,14 +32,15 @@ except Exception:  # drag and drop is a nicety; everything else works without it
 BG, PANEL, FIELD, HOVER = "#1e1f22", "#2b2d31", "#383a40", "#4e5058"
 FG, MUTED, ACCENT = "#e6e6e6", "#9a9ca3", "#5865f2"
 GOOD, WARN, BAD = "#3ba55d", "#faa61a", "#ed4245"
-SEGMENTS = ("#3c4270", "#4a5190")   # parts on the timeline, alternating
-OFF_SEGMENT = "#34363c"
 
 CHECKED, UNCHECKED = "☑", "☐"
 DEFAULT_NAME = re.compile(r"Part \d+")
 SYMBOLS = ("Segoe UI Symbol", 11)
+UNDO_LIMIT = 200
+RECENT_LIMIT = 12
 
 END_MODES = {"stop": "Stop", "loop": "Loop the part", "continue": "Keep playing"}
+SAVE_AS = {"video": "Video", "sound": "Sound only"}
 
 PART_COLUMNS = (  # id, heading, width, anchor, stretch
     ("use", "", 34, "center", False),
@@ -55,7 +57,11 @@ SHORTCUTS = """Space  play / pause
 ,  .  one frame back / forward
 Ctrl+←  Ctrl+→  keyframe before / after
 Home  End  start / last frame of the part
+Page Up  Page Down  previous / next part
 I  O  set the part's start / end here
+Ctrl+Z  Ctrl+Y  undo / redo
++  −  zoom the timeline in / out
+S  save the frame as a picture
 F  full screen (Esc to leave)
 M  mute"""
 
@@ -94,7 +100,7 @@ class Tooltip:
         self.tip.wm_overrideredirect(True)
         self.tip.wm_geometry(f"+{x}+{y}")
         tk.Label(self.tip, text=self.text, bg="#111214", fg=FG, justify="left",
-                 wraplength=360, padx=8, pady=5, font=("Segoe UI", 9)
+                 wraplength=380, padx=8, pady=5, font=("Segoe UI", 9)
                  ).pack(padx=1, pady=1)
 
     def _hide(self, _=None):
@@ -201,78 +207,15 @@ def file_names(parts: list[Part], ext: str, numbered: bool) -> dict[Part, str]:
     return names
 
 
-# --- The bar along the video -------------------------------------------------------
-
-class Timeline(tk.Canvas):
-    """The whole video as a bar: the parts on it, the chapters marked along the top,
-    and the playhead. Click or drag to move the playhead; double-click a part to
-    select it."""
-
-    def __init__(self, parent, app: "App", height: int = 30, bg: str = PANEL):
-        super().__init__(parent, height=height, bg=bg, highlightthickness=0, cursor="hand2")
-        self.app = app
-        self.bind("<Configure>", lambda e: self.draw())
-        self.bind("<ButtonPress-1>", self._press)
-        self.bind("<B1-Motion>", self._drag)
-        self.bind("<ButtonRelease-1>", self._release)
-        self.bind("<Double-1>", self._double)
-
-    def _scale(self) -> float:
-        info = self.app.info
-        return (self.winfo_width() - 2) / info.duration if info and info.duration else 0
-
-    def _time(self, x: int) -> float:
-        scale = self._scale()
-        return min(max((x - 1) / scale, 0.0), self.app.info.duration) if scale else 0.0
-
-    def draw(self):
-        self.delete("all")
-        app, info = self.app, self.app.info
-        scale = self._scale()
-        height = self.winfo_height()
-        if not scale:
-            return
-        selected = {p.iid for p in app._selected_parts()}
-        for i, part in enumerate(app.parts):
-            x0, x1 = 1 + part.start * scale, 1 + part.end * scale
-            color = SEGMENTS[i % 2] if part.use else OFF_SEGMENT
-            if part.iid in selected:
-                color = ACCENT
-            self.create_rectangle(x0, 6, max(x1, x0 + 1), height - 4, fill=color, width=0)
-            self.create_line(x0, 4, x0, height - 2, fill=MUTED)
-        for ch in info.chapters:
-            x = 1 + ch.start * scale
-            self.create_line(x, 0, x, 5, fill=WARN, width=2)
-        self.draw_playhead()
-
-    def draw_playhead(self):
-        self.delete("head")
-        scale = self._scale()
-        if not scale:
-            return
-        x = 1 + self.app.position * scale
-        self.create_line(x, 0, x, self.winfo_height(), fill="white", width=2, tags="head")
-        self.create_polygon(x - 5, 0, x + 5, 0, x, 6, fill="white", tags="head")
-
-    def _press(self, event):
-        if self.app.info:
-            self.app.seek(self._time(event.x), exact=False)
-
-    def _drag(self, event):
-        if self.app.info:
-            self.app.seek(self._time(event.x), exact=False)
-
-    def _release(self, event):
-        if self.app.info:
-            self.app.seek(self._time(event.x), exact=True)
-
-    def _double(self, event):
-        if not self.app.info:
-            return
-        t = self._time(event.x)
-        hits = [p for p in self.app.parts if p.start - EPS <= t < p.end + EPS]
-        if hits:
-            self.app._select(hits[-1])
+def parts_from_times(info: Info, found: list[tuple[float, str]]) -> list[Part]:
+    """Parts from a timestamp list: each runs to the next time, the last to the end."""
+    parts = []
+    found = [(t, title) for t, title in found if t < info.duration - EPS]
+    for i, (t, title) in enumerate(found):
+        end = found[i + 1][0] if i + 1 < len(found) else info.duration
+        start, end = engine.snap(info, t), engine.snap(info, end)
+        parts.append(Part(title or f"Part {i + 1}", start, end, use=end - start > EPS))
+    return parts
 
 
 # --- Full screen -------------------------------------------------------------------
@@ -297,8 +240,8 @@ class FullScreen(tk.Toplevel):
         self.time_label.pack(side="left", padx=10)
         ttk.Button(self.bar, text="Leave full screen", command=app.leave_full_screen
                    ).pack(side="right")
-        self.timeline = Timeline(self.bar, app, height=26, bg=FIELD)
-        self.timeline.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        self.overview = Overview(self.bar, app, height=24, bg=FIELD)
+        self.overview.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self.hide_job = None
         self.bind("<Motion>", self._woken)
         self.video.bind("<Double-1>", lambda e: app.leave_full_screen())
@@ -327,6 +270,67 @@ class FullScreen(tk.Toplevel):
         self.video.configure(cursor="none")
 
 
+# --- Importing timestamps ----------------------------------------------------------
+
+class ImportDialog(tk.Toplevel):
+    """Paste (or check) a timestamp list and turn it into parts."""
+
+    def __init__(self, app: "App", text: str, source: str):
+        super().__init__(app, bg=BG)
+        self.app = app
+        self.title("Parts from timestamps")
+        self.transient(app)
+        self.geometry(f"{int(640 * app.scale)}x{int(520 * app.scale)}")
+        self.bind("<Map>", lambda e: e.widget is self and dark_title_bar(self), add=True)
+        box = ttk.Frame(self, padding=12)
+        box.pack(fill="both", expand=True)
+        ttk.Label(box, text=source, style="Note.TLabel", wraplength=int(600 * app.scale),
+                  justify="left").pack(anchor="w")
+        holder = ttk.Frame(box)
+        holder.pack(fill="both", expand=True, pady=8)
+        self.text = tk.Text(holder, bg=FIELD, fg=FG, insertbackground=FG, relief="flat",
+                            wrap="word", font=("Segoe UI", 9), padx=6, pady=4,
+                            selectbackground=ACCENT, undo=True)
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=scroll.set)
+        self.text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="left", fill="y")
+        self.text.insert("1.0", text)
+        self.text.bind("<<Modified>>", self._changed)
+        row = ttk.Frame(box)
+        row.pack(fill="x")
+        self.found_label = ttk.Label(row, text="", style="Muted.TLabel")
+        self.found_label.pack(side="left")
+        ttk.Button(row, text="Make parts", style="Accent.TButton",
+                   command=self._make).pack(side="right")
+        ttk.Button(row, text="Cancel", command=self.destroy).pack(side="right", padx=(0, 6))
+        self._changed()
+        self.text.focus_set()
+
+    def _found(self):
+        return timestamps.parse(self.text.get("1.0", "end"))
+
+    def _changed(self, _=None):
+        self.text.edit_modified(False)
+        found = self._found()
+        if found:
+            first = ", ".join(f"{timestamps.stamp(t)} {title}".strip()
+                              for t, title in found[:3])
+            more = "…" if len(found) > 3 else ""
+            self.found_label.configure(
+                text=f"{len(found)} timestamp{'s' * (len(found) != 1)}: {first}{more}")
+        else:
+            self.found_label.configure(text="No timestamps yet: lines like “4:38 Title”.")
+
+    def _make(self):
+        found = self._found()
+        if not found:
+            self.bell()
+            return
+        self.app.import_times(found)
+        self.destroy()
+
+
 # --- The window -------------------------------------------------------------------
 
 class App(BaseTk):
@@ -334,7 +338,7 @@ class App(BaseTk):
         super().__init__()
         self.title("Splicer")
         self.configure(bg=BG)
-        self.minsize(1000, 640)
+        self.minsize(1000, 680)
         if ICON.exists():
             try:
                 self.iconbitmap(default=str(ICON))
@@ -355,8 +359,13 @@ class App(BaseTk):
         self.shown_part: Part | None = None
         self.full_screen: FullScreen | None = None
         self.redraw_job = None
+        self.save_job = None
         self.muted = False
         self._filling = False
+        self.undo: list = []
+        self.redo: list = []
+        self.last_edit = None              # consecutive edits of one kind undo together
+        self.subtitle_choices: dict[str, int | None] = {"Off": None}
 
         self._style()
         self._build()
@@ -365,9 +374,8 @@ class App(BaseTk):
         self.player.set_end_mode(self.end_mode)
         self._sync()
         geometry = self.settings.get("geometry", "")
-        scale = self.ui_font.measure("0") / 7
-        width = min(int(1440 * scale), int(self.winfo_screenwidth() * 0.92))
-        height = min(int(900 * scale), int(self.winfo_screenheight() * 0.88))
+        width = min(int(1500 * self.scale), int(self.winfo_screenwidth() * 0.94))
+        height = min(int(940 * self.scale), int(self.winfo_screenheight() * 0.9))
         self.geometry(geometry if on_screen(geometry) else f"{width}x{height}")
         self.bind("<Map>", self._mapped, add=True)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -395,10 +403,13 @@ class App(BaseTk):
     def _save(self):
         self.settings["geometry"] = self.geometry()
         self.settings["numbered"] = bool(self.numbered_var.get())
+        self.settings["joined"] = bool(self.joined_var.get())
         self.settings["volume"] = int(self.volume_var.get())
         self.settings["end_mode"] = self.end_mode
+        self.settings["save_as"] = self.save_as
         try:
-            self.settings["sashes"] = [self.panes.sashpos(0), self.left.sashpos(0)]
+            self.settings["panes"] = [self.upper.sashpos(0), self.outer.sashpos(0)]
+            self.settings.pop("sashes", None)  # 1.1's layout
         except tk.TclError:
             pass
         try:
@@ -409,13 +420,15 @@ class App(BaseTk):
 
     def _restore_sashes(self):
         self.update_idletasks()
-        saved = self.settings.get("sashes")
-        width, height = self.panes.winfo_width(), self.left.winfo_height()
-        main = saved[0] if saved else int(width * 0.46)
-        side = saved[1] if saved else int(self.ui_font.metrics("linespace") * 9)
+        saved = self.settings.get("panes")
+        ok = isinstance(saved, list) and len(saved) == 2
+        width, height = self.upper.winfo_width(), self.outer.winfo_height()
+        main = saved[0] if ok else int(width * 0.42)
+        lower = saved[1] if ok else height - int(165 * self.scale)
         try:
-            self.panes.sashpos(0, min(max(main, 300), width - 300))
-            self.left.sashpos(0, min(max(side, 60), height - 200))
+            self.upper.sashpos(0, min(max(main, 320), width - 360))
+            self.outer.sashpos(0, min(max(lower, int(height * 0.55)),
+                                      height - int(110 * self.scale)))
         except tk.TclError:
             pass
 
@@ -435,6 +448,9 @@ class App(BaseTk):
         st.map("Accent.TButton", background=[("active", "#4752c4"), ("disabled", FIELD)])
         st.configure("Step.TButton", padding=(4, 1), width=-2)
         st.configure("Transport.TButton", font=SYMBOLS, padding=(6, 0), width=-2)
+        st.configure("TMenubutton", background=FIELD, foreground=FG, padding=(8, 2),
+                     arrowcolor=FG, borderwidth=0)
+        st.map("TMenubutton", background=[("active", HOVER)])
         st.configure("Muted.TLabel", foreground=MUTED)
         st.configure("Time.TLabel", font=("Segoe UI", 10))
         st.configure("Bar.TFrame", background=PANEL)
@@ -458,6 +474,12 @@ class App(BaseTk):
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         self.option_add("*TCombobox*Listbox.selectForeground", "white")
+        self.option_add("*Menu.background", PANEL)
+        self.option_add("*Menu.foreground", FG)
+        self.option_add("*Menu.activeBackground", ACCENT)
+        self.option_add("*Menu.activeForeground", "white")
+        self.option_add("*Menu.disabledForeground", "#62646b")
+        self.option_add("*Menu.relief", "flat")
         st.configure("TEntry", padding=(4, 2))
         st.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=FIELD,
                      bordercolor=FIELD, lightcolor=ACCENT, darkcolor=ACCENT)
@@ -467,7 +489,20 @@ class App(BaseTk):
         st.configure("Sash", sashthickness=7, gripcount=0, background=BG,
                      lightcolor=BG, darkcolor=BG, bordercolor=BG)
         st.map("Sash", background=[("active", HOVER)])
+        st.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        st.configure("TNotebook.Tab", background=FIELD, foreground=MUTED, padding=(14, 4),
+                     borderwidth=0)
+        st.map("TNotebook.Tab", background=[("selected", PANEL)],
+               foreground=[("selected", FG)], expand=[("selected", (0, 0, 0, 0))])
+        st.configure("Tab.TFrame", background=PANEL)
+        st.configure("Tab.TLabel", background=PANEL)
+        st.configure("TabNote.TLabel", background=PANEL, foreground=MUTED)
+        st.configure("Tab.TCheckbutton", background=PANEL, indicatorbackground=FIELD,
+                     indicatorforeground="white", indicatormargin=(0, 0, 4, 0))
+        st.map("Tab.TCheckbutton", background=[("active", PANEL)],
+               indicatorbackground=[("selected", ACCENT), ("disabled", PANEL)])
         self.ui_font = font.Font(family="Segoe UI", size=9)
+        self.scale = self.ui_font.measure("0") / 7
         st.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=FG,
                      rowheight=self.ui_font.metrics("linespace") + 6, borderwidth=0)
         st.map("Treeview", background=[("selected", ACCENT)],
@@ -491,20 +526,25 @@ class App(BaseTk):
         keys.pack(side="right")
         tip(keys, SHORTCUTS)
 
-        # Three sections, each resizable by dragging the gaps between them
-        self.panes = ttk.Panedwindow(self, orient="horizontal")
-        self.panes.pack(fill="both", expand=True, padx=8, pady=(6, 4))
-        self.left = ttk.Panedwindow(self.panes, orient="vertical")
-        self.panes.add(self.left, weight=1)
-        tracks = ttk.Frame(self.left, padding=(2, 2, 6, 6))
-        self.left.add(tracks, weight=0)
-        parts = ttk.Frame(self.left, padding=(2, 6, 6, 2))
-        self.left.add(parts, weight=1)
-        player = ttk.Frame(self.panes, padding=(8, 2, 2, 2))
-        self.panes.add(player, weight=2)
-        self._build_tracks(tracks)
+        # Parts and Tracks | Player, over the timeline: drag the gaps to resize
+        self.outer = ttk.Panedwindow(self, orient="vertical")
+        self.outer.pack(fill="both", expand=True, padx=8, pady=(6, 4))
+        self.upper = ttk.Panedwindow(self.outer, orient="horizontal")
+        self.outer.add(self.upper, weight=1)
+        self.tabs = ttk.Notebook(self.upper)
+        self.upper.add(self.tabs, weight=1)
+        parts = ttk.Frame(self.tabs, style="Tab.TFrame", padding=8)
+        tracks = ttk.Frame(self.tabs, style="Tab.TFrame", padding=8)
+        self.tabs.add(parts, text="Parts")
+        self.tabs.add(tracks, text="Tracks")
+        player = ttk.Frame(self.upper, padding=(8, 0, 0, 0))
+        self.upper.add(player, weight=2)
+        lower = ttk.Frame(self.outer, padding=(0, 6, 0, 0))
+        self.outer.add(lower, weight=0)
         self._build_parts(parts)
+        self._build_tracks(tracks)
         self._build_player(player)
+        self._build_timeline(lower)
 
         if DND_FILES:
             try:
@@ -521,6 +561,10 @@ class App(BaseTk):
         tip(ttk.Button(row, text="Open video…", style="Accent.TButton",
                        command=self._choose_file),
             "Pick a video (Ctrl+O). You can also drop one onto the window.").pack(side="left")
+        self.recent_menu = tk.Menu(self, tearoff=False, postcommand=self._fill_recent)
+        recent = ttk.Menubutton(row, text="Recent", menu=self.recent_menu)
+        recent.pack(side="left", padx=(6, 0))
+        tip(recent, "Videos you opened lately.")
         names = ttk.Frame(row, style="Bar.TFrame")
         names.pack(side="left", fill="x", expand=True, padx=(12, 0))
         self.file_label = ttk.Label(names, text="No video open", style="BarStrong.TLabel")
@@ -537,6 +581,19 @@ class App(BaseTk):
         self.output_entry.pack(side="left", fill="x", expand=True, padx=6)
         self.browse_btn = ttk.Button(row, text="Browse…", command=self._browse_output)
         self.browse_btn.pack(side="left")
+        ttk.Label(row, text="as", style="Bar.TLabel").pack(side="left", padx=(12, 4))
+        self.save_as = self.settings.get("save_as", "video")
+        if self.save_as not in SAVE_AS:
+            self.save_as = "video"
+        self.save_as_var = tk.StringVar(value=SAVE_AS[self.save_as])
+        self.save_as_box = ttk.Combobox(row, textvariable=self.save_as_var, state="readonly",
+                                        width=11, values=list(SAVE_AS.values()))
+        self.save_as_box.pack(side="left")
+        self.save_as_box.bind("<<ComboboxSelected>>", lambda e: self._save_as_changed())
+        tip(self.save_as_box, "Video: every checked track, in a file like the original.\n"
+            "Sound only: just the first checked sound track, in its own kind of file "
+            "(Opus as .opus, AAC as .m4a, MP3 as .mp3, FLAC as .flac, anything else as "
+            ".mka), numbered as tracks of an album named after the video.")
         self.numbered_var = tk.BooleanVar(value=self.settings.get("numbered", True))
         self.numbered_check = tip(
             ttk.Checkbutton(row, text="Number the files", variable=self.numbered_var,
@@ -555,16 +612,17 @@ class App(BaseTk):
         self.open_btn = tip(ttk.Button(row, text="Open folder", command=self._open_output),
                             "Show the folder the parts were saved in.")
         self.open_btn.pack(side="right", padx=(0, 6))
-        self.progress = ttk.Progressbar(row, maximum=1.0, length=140)
+        self.progress = ttk.Progressbar(row, maximum=1.0, length=120)
         self.progress.pack(side="right", padx=(0, 10))
 
     def _build_tracks(self, box):
-        ttk.Label(box, text="Tracks", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(box, text="Checked tracks go into every part, and the first checked "
-                  "sound track is the one you hear. Click to check or uncheck.",
-                  style="Note.TLabel", wraplength=520, justify="left").pack(anchor="w")
-        holder = ttk.Frame(box)
-        holder.pack(fill="both", expand=True, pady=(3, 0))
+        note = ttk.Label(box, text="Checked tracks go into every part, and the first checked "
+                         "sound track is the one you hear. Click a track to check or uncheck "
+                         "it.", style="TabNote.TLabel", justify="left")
+        note.pack(anchor="w", fill="x")
+        note.bind("<Configure>", lambda e: note.configure(wraplength=max(e.width - 4, 100)))
+        holder = ttk.Frame(box, style="Tab.TFrame")
+        holder.pack(fill="both", expand=True, pady=(6, 0))
         self.tracks = ttk.Treeview(holder, columns=("use", "track"), show="", height=3,
                                    selectmode="none")
         self.tracks.column("use", width=34, stretch=False, anchor="center")
@@ -577,15 +635,28 @@ class App(BaseTk):
         self.tracks.bind("<Button-1>", self._toggle_track)
 
     def _build_parts(self, box):
-        head = ttk.Frame(box)
+        head = ttk.Frame(box, style="Tab.TFrame")
         head.pack(fill="x")
-        ttk.Label(head, text="Parts", style="Section.TLabel").pack(side="left")
-        self.parts_note = ttk.Label(head, text="", style="Note.TLabel")
-        self.parts_note.pack(side="left", padx=(8, 0))
+        self.parts_note = ttk.Label(head, text="", style="TabNote.TLabel")
+        self.parts_note.pack(side="left")
         self.part_buttons = []
+        self.more_menu = tk.Menu(self, tearoff=False)
+        self.more_menu.add_command(label="Parts from timestamps…", command=self.open_import)
+        self.more_menu.add_command(label="Copy the parts as timestamps",
+                                   command=self.copy_times)
+        self.more_menu.add_separator()
+        self.more_menu.add_command(label="Start again from the chapters",
+                                   command=self._reset_parts)
+        more = ttk.Menubutton(head, text="More", menu=self.more_menu)
+        more.pack(side="right", padx=(4, 0))
+        self.part_buttons.append(more)
+        self.redo_btn = tip(ttk.Button(head, text="↷", style="Step.TButton",
+                                       command=self.do_redo), "Redo (Ctrl+Y)")
+        self.redo_btn.pack(side="right", padx=(4, 0))
+        self.undo_btn = tip(ttk.Button(head, text="↶", style="Step.TButton",
+                                       command=self.do_undo), "Undo (Ctrl+Z)")
+        self.undo_btn.pack(side="right", padx=(12, 0))
         for text, command, help_text in (
-                ("Reset", self._reset_parts,
-                 "Start over: one part per chapter, or the whole video if it has none."),
                 ("Remove", self._remove_parts, "Remove the selected parts (Delete)."),
                 ("Split", self._split_part,
                  "Cut the selected part in two: at the playhead if it's inside the part, "
@@ -598,10 +669,10 @@ class App(BaseTk):
             self.part_buttons.append(b)
 
         # The selected part, under the list; the list gives way when space is short
-        edit = ttk.Frame(box, padding=(0, 8, 0, 0))
+        edit = ttk.Frame(box, style="Tab.TFrame", padding=(0, 8, 0, 0))
         edit.pack(side="bottom", fill="x")
-        holder = ttk.Frame(box)
-        holder.pack(fill="both", expand=True, pady=(4, 0))
+        holder = ttk.Frame(box, style="Tab.TFrame")
+        holder.pack(fill="both", expand=True, pady=(6, 0))
         self.tree = ttk.Treeview(holder, columns=[c[0] for c in PART_COLUMNS],
                                  show="headings", selectmode="extended", height=4)
         for cid, heading, width, anchor, stretch in PART_COLUMNS:
@@ -620,7 +691,8 @@ class App(BaseTk):
                                                 self.title_entry.select_range(0, "end")))
 
         edit.columnconfigure(1, weight=1)
-        ttk.Label(edit, text="Name").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(edit, text="Name", style="Tab.TLabel").grid(row=0, column=0, sticky="w",
+                                                             pady=(0, 6))
         self.title_var = tk.StringVar()
         self.title_entry = ttk.Entry(edit, textvariable=self.title_var)
         self.title_entry.grid(row=0, column=1, sticky="ew", pady=(0, 6))
@@ -628,9 +700,9 @@ class App(BaseTk):
         self.edit_widgets = [self.title_entry]
         self.time_vars, self.side_notes = {}, {}
         for r, side in enumerate(("start", "end"), 1):
-            ttk.Label(edit, text="Starts at" if side == "start" else "Ends at"
-                      ).grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
-            line = ttk.Frame(edit)
+            ttk.Label(edit, text="Starts at" if side == "start" else "Ends at",
+                      style="Tab.TLabel").grid(row=r, column=0, sticky="w", padx=(0, 8), pady=2)
+            line = ttk.Frame(edit, style="Tab.TFrame")
             line.grid(row=r, column=1, sticky="w", pady=2)
             back = tip(ttk.Button(line, text="◀", style="Step.TButton",
                                   command=lambda s=side: self._step_cut(s, -1)),
@@ -657,12 +729,18 @@ class App(BaseTk):
                         "End the part after the frame in the player (O), or at the keyframe "
                         "nearest that."))
             here.pack(side="left", padx=(8, 0))
-            note = ttk.Label(line, text="", style="Note.TLabel")
+            note = ttk.Label(line, text="", style="TabNote.TLabel")
             note.pack(side="left", padx=(8, 0))
             self.time_vars[side], self.side_notes[side] = var, note
             self.edit_widgets += [back, entry, forward, here]
-        self.length_label = ttk.Label(edit, text="", style="Muted.TLabel")
+        self.length_label = ttk.Label(edit, text="", style="TabNote.TLabel")
         self.length_label.grid(row=3, column=1, sticky="w", pady=(2, 0))
+        self.joined_var = tk.BooleanVar(value=self.settings.get("joined", True))
+        tip(ttk.Checkbutton(edit, text="Keep touching parts joined", variable=self.joined_var,
+                            style="Tab.TCheckbutton"),
+            "When a part ends where the next one starts, moving that cut moves both, so "
+            "nothing falls between them.").grid(row=4, column=0, columnspan=2, sticky="w",
+                                                pady=(8, 0))
 
     def _build_player(self, box):
         head = ttk.Frame(box)
@@ -673,8 +751,8 @@ class App(BaseTk):
 
         controls = ttk.Frame(box, padding=(0, 6, 0, 0))
         controls.pack(side="bottom", fill="x")
-        self.timeline = Timeline(box, self, height=30)
-        self.timeline.pack(side="bottom", fill="x", pady=(6, 0))
+        self.overview = Overview(box, self, height=20)
+        self.overview.pack(side="bottom", fill="x", pady=(6, 0))
         self.video = tk.Frame(box, bg="black", cursor="hand2")
         self.video.pack(fill="both", expand=True, pady=(4, 0))
         self.placeholder = tk.Label(self.video, text="Open a video to watch it here.",
@@ -716,6 +794,14 @@ class App(BaseTk):
 
         row = ttk.Frame(controls)
         row.pack(fill="x", pady=(6, 0))
+        # The volume gets its room first; the rest shares what's left
+        self.volume_var = tk.DoubleVar(value=self.settings.get("volume", 80))
+        volume = ttk.Scale(row, from_=0, to=100, variable=self.volume_var, length=110,
+                           command=lambda v: self.player.set_volume(self._volume()))
+        volume.pack(side="right")
+        self.mute_btn = tip(ttk.Button(row, text="🔊", style="Transport.TButton",
+                                       command=self.toggle_mute), "Mute (M)")
+        self.mute_btn.pack(side="right", padx=(0, 4))
         ttk.Label(row, text="At the end of the part").pack(side="left")
         self.end_mode = self.settings.get("end_mode", "stop")
         if self.end_mode not in END_MODES:
@@ -727,18 +813,49 @@ class App(BaseTk):
         mode.bind("<<ComboboxSelected>>", lambda e: self._end_mode_changed())
         tip(mode, "Stop: stop on the part's last frame. Loop the part: go back to its "
             "start and carry on. Keep playing: play on past the end.")
-        self.volume_var = tk.DoubleVar(value=self.settings.get("volume", 80))
-        volume = ttk.Scale(row, from_=0, to=100, variable=self.volume_var, length=110,
-                           command=lambda v: self.player.set_volume(self._volume()))
-        volume.pack(side="right")
-        self.mute_btn = tip(ttk.Button(row, text="🔊", style="Transport.TButton",
-                                       command=self.toggle_mute), "Mute (M)")
-        self.mute_btn.pack(side="right", padx=(0, 4))
+        ttk.Label(row, text="Subtitles").pack(side="left", padx=(14, 0))
+        self.subtitle_var = tk.StringVar(value="Off")
+        self.subtitle_box = ttk.Combobox(row, textvariable=self.subtitle_var, state="readonly",
+                                         width=18, values=["Off"])
+        self.subtitle_box.pack(side="left", padx=(6, 0))
+        self.subtitle_box.bind("<<ComboboxSelected>>", lambda e: self._subtitles_changed())
+        tip(self.subtitle_box, "Subtitles to show in the player. Only text subtitles can be "
+            "shown here; every checked subtitle track goes into the parts either way.")
+        self.frame_btn = tip(ttk.Button(row, text="Save frame", command=self.save_frame),
+                             "Save the picture in the player, at full size, as a PNG in the "
+                             "folder the parts go to (S).")
+        self.frame_btn.pack(side="left", padx=(14, 0))
+
+    def _build_timeline(self, box):
+        head = ttk.Frame(box)
+        head.pack(fill="x")
+        ttk.Label(head, text="Timeline", style="Section.TLabel").pack(side="left")
+        ttk.Label(head, text="Drag a cut to move it  ·  click to move the playhead  ·  "
+                  "Ctrl+wheel zooms, wheel scrolls", style="Note.TLabel"
+                  ).pack(side="left", padx=(10, 0))
+        self.zoom_buttons = []
+        for text, command, help_text in (
+                ("Whole video", lambda: self.timeline.fit(), "Show the whole video."),
+                ("Part", self.zoom_to_part, "Zoom to the selected part."),
+                ("+", lambda: self.timeline.zoom(0.5), "Zoom in (+)."),
+                ("−", lambda: self.timeline.zoom(2.0), "Zoom out (−)."),
+        ):
+            b = tip(ttk.Button(head, text=text, command=command,
+                               style="Step.TButton" if len(text) == 1 else "TButton"),
+                    help_text)
+            b.pack(side="right", padx=(4, 0))
+            self.zoom_buttons.append(b)
+        self.timeline = Timeline(box, self)
+        self.timeline.pack(fill="both", expand=True, pady=(4, 0))
 
     # --- Keys ---
 
     def _bind_keys(self):
         self.bind_all("<Control-o>", lambda e: self._choose_file())
+        for key in ("<Control-z>", "<Control-Z>"):
+            self.bind_all(key, lambda e: self._undo_key(e, self.do_undo))
+        for key in ("<Control-y>", "<Control-Y>", "<Control-Shift-z>", "<Control-Shift-Z>"):
+            self.bind_all(key, lambda e: self._undo_key(e, self.do_redo))
         keys = {
             "<space>": self.toggle_play,
             "<Left>": lambda: self.jump(-5), "<Right>": lambda: self.jump(5),
@@ -747,8 +864,15 @@ class App(BaseTk):
             "<Control-Right>": lambda: self.jump_keyframe(1),
             "<Home>": lambda: self.go_part_edge("start"),
             "<End>": lambda: self.go_part_edge("end"),
+            "<Prior>": lambda: self.select_next(-1), "<Next>": lambda: self.select_next(1),
             "<i>": lambda: self._cut_here("start"), "<I>": lambda: self._cut_here("start"),
             "<o>": lambda: self._cut_here("end"), "<O>": lambda: self._cut_here("end"),
+            "<s>": self.save_frame, "<S>": self.save_frame,
+            "<plus>": lambda: self.timeline.zoom(0.5),
+            "<equal>": lambda: self.timeline.zoom(0.5),
+            "<KP_Add>": lambda: self.timeline.zoom(0.5),
+            "<minus>": lambda: self.timeline.zoom(2.0),
+            "<KP_Subtract>": lambda: self.timeline.zoom(2.0),
             "<f>": self.toggle_full_screen, "<F>": self.toggle_full_screen,
             "<F11>": self.toggle_full_screen,
             "<Escape>": self.leave_full_screen,
@@ -757,14 +881,22 @@ class App(BaseTk):
         for key, action in keys.items():
             self.bind_all(key, lambda e, a=action: self._key(e, a))
         # The parts list has its own meaning for these; the player's comes first
-        for key in ("<space>", "<Left>", "<Right>", "<Home>", "<End>"):
+        for key in ("<space>", "<Left>", "<Right>", "<Home>", "<End>", "<Prior>", "<Next>"):
             self.tree.bind(key, lambda e, k=key: self._key(e, keys[k]))
 
+    def _typing(self, widget) -> bool:
+        return isinstance(widget, (ttk.Entry, tk.Entry, ttk.Combobox, tk.Text))
+
     def _key(self, event, action):
-        if isinstance(event.widget, (ttk.Entry, tk.Entry, ttk.Combobox)) and \
-                event.keysym != "Escape":
-            return None  # typing
-        if not self.info and event.keysym not in ("Escape",):
+        if self._typing(event.widget) and event.keysym != "Escape":
+            return None
+        if not self.info and event.keysym != "Escape":
+            return None
+        action()
+        return "break"
+
+    def _undo_key(self, event, action):
+        if isinstance(event.widget, tk.Text):  # the timestamps box has its own undo
             return None
         action()
         return "break"
@@ -781,6 +913,29 @@ class App(BaseTk):
         if path:
             self.open_video(Path(path))
 
+    def _fill_recent(self):
+        menu = self.recent_menu
+        menu.delete(0, "end")
+        recent = [p for p in self.settings.get("recent", []) if isinstance(p, str)]
+        if not recent:
+            menu.add_command(label="Nothing yet", state="disabled")
+            return
+        for path in recent:
+            exists = Path(path).is_file()
+            menu.add_command(label=path if exists else f"{path}  (missing)",
+                             state="normal" if exists else "disabled",
+                             command=lambda p=path: self.open_video(Path(p)))
+        menu.add_separator()
+        menu.add_command(label="Clear this list", command=self._clear_recent)
+
+    def _clear_recent(self):
+        self.settings["recent"] = []
+
+    def _remember_recent(self, path: Path):
+        recent = [p for p in self.settings.get("recent", []) if isinstance(p, str)
+                  and Path(p) != path]
+        self.settings["recent"] = [str(path)] + recent[:RECENT_LIMIT - 1]
+
     def _drop(self, event):
         paths = [Path(p) for p in self.tk.splitlist(event.data)]
         files = [p for p in paths if p.is_file()]
@@ -791,12 +946,14 @@ class App(BaseTk):
         if self.busy:
             self.bell()
             return
+        self._save_project_now()
         self.settings["last_dir"] = str(path.parent)
         self.load_id += 1
         self.busy = "reading"
         self.cancel.clear()
         self.player.unload()
         self.info, self.parts, self.track_use = None, [], {}
+        self.undo, self.redo, self.last_edit = [], [], None
         self.shown_part = None
         self.position = 0.0
         self.last_output = None
@@ -834,15 +991,70 @@ class App(BaseTk):
             bits.append(f"{len(info.keyframes)} keyframes")
         else:
             bits.append("no picture: cuts can go anywhere")
+        if timestamps.best_source(info.tags):
+            bits.append("timestamps in its description (More ▸ Parts from timestamps)")
         self.file_detail.configure(text="  ·  ".join(bits))
         self.output_var.set(str(info.path.parent / engine.safe_name(info.path.stem)))
         if info.has_video:
             self.placeholder.place_forget()
         else:
             self.placeholder.configure(text="No picture: sound only.")
+        self._remember_recent(info.path)
         self.player.load(info.path, info.origin, info.duration, self._audio_track())
-        self._reset_parts(ask=False)
-        self.status.configure(text="Check the tracks and parts, then press Splice.")
+        restored = self._restore_project()
+        if not restored:
+            self._reset_parts(ask=False)
+        self.player.set_audio(self._audio_track())  # the restored tracks may differ
+        self._refresh_tracks()
+        self._fill_subtitles()
+        self.timeline.fit()
+        if restored:
+            self.status.configure(text="Picked up where you left off with this video. "
+                                       "More ▸ Start again from the chapters to undo that.")
+        else:
+            self.status.configure(text="Check the tracks and parts, then press Splice.")
+
+    # --- Remembering each video's parts ---
+
+    def _restore_project(self) -> bool:
+        data = projects.load(self.info.path)
+        if not data:
+            return False
+        parts = []
+        try:
+            for title, start, end, use in data["parts"]:
+                start, end = float(start), float(end)
+                if not (0 <= start < end <= self.info.duration + 0.01):
+                    return False
+                parts.append(Part(str(title), start, min(end, self.info.duration), bool(use)))
+            for index, on in (data.get("tracks") or {}).items():
+                if int(index) in self.track_use:
+                    self.track_use[int(index)] = bool(on)
+        except (TypeError, ValueError):
+            return False
+        if not parts:
+            return False
+        self.parts = parts
+        self._sorted()
+        self._refresh_all()
+        self._select(self.parts[0])
+        return True
+
+    def _project_changed(self):
+        if self.save_job:
+            self.after_cancel(self.save_job)
+        self.save_job = self.after(800, self._save_project_now)
+
+    def _save_project_now(self):
+        if self.save_job:
+            self.after_cancel(self.save_job)
+            self.save_job = None
+        if not self.info:
+            return
+        projects.save(self.info.path, {
+            "parts": [[p.title, p.start, p.end, p.use] for p in self.parts],
+            "tracks": {str(k): v for k, v in self.track_use.items()},
+        })
 
     # --- Tracks ---
 
@@ -858,12 +1070,17 @@ class App(BaseTk):
     def _refresh_tracks(self):
         self.tracks.delete(*self.tracks.get_children())
         if not self.info:
+            self.tabs.tab(1, text="Tracks")
             return
         for t in self.info.tracks:
             on = self.track_use.get(t.index, False)
+            label = t.label + ("" if t.kind != "subtitle" or t.text
+                               else "  (can't be shown in the player)")
             self.tracks.insert("", "end", iid=str(t.index),
-                               values=(CHECKED if on else UNCHECKED, t.label),
+                               values=(CHECKED if on else UNCHECKED, label),
                                tags=() if on else ("off",))
+        used = sum(self.track_use.values())
+        self.tabs.tab(1, text=f"Tracks  {used} of {len(self.info.tracks)}")
 
     def _toggle_track(self, event):
         iid = self.tracks.identify_row(event.y)
@@ -871,12 +1088,76 @@ class App(BaseTk):
             return
         index = int(iid)
         self.track_use[index] = not self.track_use.get(index, False)
-        on = self.track_use[index]
-        self.tracks.item(iid, values=(CHECKED if on else UNCHECKED,
-                                      self.tracks.item(iid, "values")[1]),
-                         tags=() if on else ("off",))
+        self._refresh_tracks()
         self.player.set_audio(self._audio_track())
-        self._sync()
+        self._refresh_parts()  # sound only: the file names follow the sound track
+        self._project_changed()
+
+    def _fill_subtitles(self):
+        self.subtitle_choices = {"Off": None}
+        chosen = "Off"
+        if self.info:
+            for t in self.info.tracks:
+                if t.kind == "subtitle" and t.text and self.info.subtitles.get(t.index):
+                    label = " · ".join(x for x in (engine.language_name(t.language)
+                                                   if t.language not in ("", "und") else "",
+                                                   t.title) if x) or f"Track {t.index}"
+                    while label in self.subtitle_choices:
+                        label += " "
+                    self.subtitle_choices[label] = t.index
+                    if chosen == "Off" and self.track_use.get(t.index) and (t.default or t.forced):
+                        chosen = label
+        self.subtitle_box.configure(values=list(self.subtitle_choices))
+        self.subtitle_var.set(chosen)
+        self._subtitles_changed()
+
+    def _subtitles_changed(self):
+        index = self.subtitle_choices.get(self.subtitle_var.get())
+        cues = self.info.subtitles.get(index) if self.info and index is not None else None
+        self.player.set_subtitles(cues)
+
+    # --- Undo ---
+
+    def _snapshot(self):
+        return [(p.title, p.start, p.end, p.use) for p in self.parts]
+
+    def _remember(self, kind=None):
+        """Call before changing the parts."""
+        if kind is not None and kind == self.last_edit:
+            return  # typing a name: one undo for the lot
+        self.undo.append(self._snapshot())
+        del self.undo[:-UNDO_LIMIT]
+        self.redo.clear()
+        self.last_edit = kind
+
+    def _back_to(self, snapshot):
+        current = self._current()
+        index = self.parts.index(current) if current in self.parts else 0
+        self.parts = [Part(*s) for s in snapshot]
+        self.last_edit = None
+        self.shown_part = None
+        self._refresh_parts()
+        if self.parts:
+            part = self.parts[min(index, len(self.parts) - 1)]
+            self.shown_part = part  # leave the player where it is
+            self._select(part, seek=False)
+        else:
+            self._show_selected()
+        self._project_changed()
+
+    def do_undo(self):
+        if not self.undo or self.busy or not self.info:
+            return
+        self.redo.append(self._snapshot())
+        self._back_to(self.undo.pop())
+        self.status.configure(text="Undone.")
+
+    def do_redo(self):
+        if not self.redo or self.busy or not self.info:
+            return
+        self.undo.append(self._snapshot())
+        self._back_to(self.redo.pop())
+        self.status.configure(text="Redone.")
 
     # --- Parts ---
 
@@ -884,10 +1165,8 @@ class App(BaseTk):
         info = self.info
         if not info or self.busy:
             return
-        if ask and self.parts and not messagebox.askyesno(
-                "Splicer", "Throw away your changes and start again from the chapters?",
-                parent=self):
-            return
+        if ask:
+            self._remember()
         if info.chapters:
             self.parts = []
             for ch in info.chapters:
@@ -900,6 +1179,9 @@ class App(BaseTk):
         self._refresh_parts()
         if self.parts:
             self._select(self.parts[0])
+        if ask:
+            self.status.configure(text="Back to the chapters. Ctrl+Z undoes that.")
+            self._project_changed()
 
     def _sorted(self):
         self.parts.sort(key=lambda p: (p.start, p.end))
@@ -907,6 +1189,14 @@ class App(BaseTk):
         for n, part in enumerate(self.parts, 1):
             if DEFAULT_NAME.fullmatch(part.title):
                 part.title = f"Part {n}"
+
+    def _changed(self, select: Part | None = None):
+        """After any change to the parts: tidy, show, remember."""
+        self._sorted()
+        self._refresh_parts()
+        if select is not None and select in self.parts:
+            self._select(select)
+        self._project_changed()
 
     def _refresh_parts(self):
         keep = self._selected_parts()
@@ -933,14 +1223,29 @@ class App(BaseTk):
             total = sum(p.length for p in used)
             self.parts_note.configure(text=f"{len(used)} of {len(self.parts)} checked  ·  "
                                            f"{fmt_time(total).rsplit('.', 1)[0]} in all")
+            self.tabs.tab(0, text=f"Parts  {len(used)} of {len(self.parts)}")
         else:
             self.parts_note.configure(text="")
+            self.tabs.tab(0, text="Parts")
         self._draw_timelines()
         self._sync()
 
+    def _sound_track(self):
+        """The track saved when saving sound only."""
+        index = self._audio_track()
+        return next((t for t in self.info.tracks if t.index == index), None) \
+            if self.info and index is not None else None
+
+    def _ext(self) -> str:
+        if not self.info:
+            return ""
+        if self.save_as == "sound":
+            track = self._sound_track()
+            return engine.sound_ext(track) if track else ".mka"
+        return self.info.path.suffix.lower()
+
     def _names(self) -> dict[Part, str]:
-        ext = self.info.path.suffix.lower() if self.info else ""
-        return file_names(self.parts, ext, bool(self.numbered_var.get()))
+        return file_names(self.parts, self._ext(), bool(self.numbered_var.get()))
 
     def _selected_parts(self) -> list[Part]:
         wanted = set(self.tree.selection())
@@ -954,11 +1259,20 @@ class App(BaseTk):
                 return p
         return selected[0] if selected else None
 
-    def _select(self, part: Part):
+    def _select(self, part: Part, seek: bool = True):
+        if not seek:
+            self.shown_part = part
         self.tree.selection_set(part.iid)
         self.tree.focus(part.iid)
         self.tree.see(part.iid)
         self._show_selected()
+
+    def select_next(self, direction: int):
+        if not self.parts:
+            return
+        current = self._current()
+        index = self.parts.index(current) + direction if current in self.parts else 0
+        self._select(self.parts[min(max(index, 0), len(self.parts) - 1)])
 
     def _tree_click(self, event):
         if self.tree.identify_region(event.x, event.y) != "cell":
@@ -966,8 +1280,9 @@ class App(BaseTk):
         iid = self.tree.identify_row(event.y)
         if self.tree.identify_column(event.x) == "#1" and iid and not self.busy:
             part = next(p for p in self.parts if p.iid == iid)
+            self._remember()
             part.use = not part.use
-            self._refresh_parts()
+            self._changed()
             return "break"
         return None
 
@@ -988,11 +1303,10 @@ class App(BaseTk):
                 break
         if start is None:
             start, end = (current.start, current.end) if current else (0.0, info.duration)
+        self._remember()
         part = Part("Part 0", start, end)  # numbered by _sorted
         self.parts.append(part)
-        self._sorted()
-        self._refresh_parts()
-        self._select(part)
+        self._changed(select=part)
         self.title_entry.focus_set()
         self.title_entry.select_range(0, "end")
 
@@ -1011,26 +1325,67 @@ class App(BaseTk):
                 self.bell()
                 return
             at = min(keys, key=lambda k: abs(k - (part.start + part.end) / 2))
+        self._remember()
         title = "Part 0" if DEFAULT_NAME.fullmatch(part.title) else f"{part.title} (2)"
         second = Part(title, at, part.end, part.use)
         part.end = at
         self.parts.append(second)
-        self._sorted()
-        self._refresh_parts()
-        self._select(second)
+        self._changed(select=second)
 
     def _remove_parts(self):
         chosen = self._selected_parts()
         if not chosen or self.busy:
             return
+        self._remember()
         index = self.parts.index(chosen[0])
         self.parts = [p for p in self.parts if p not in chosen]
-        self._sorted()
-        self._refresh_parts()
+        self._changed()
         if self.parts:
             self._select(self.parts[min(index, len(self.parts) - 1)])
         else:
             self._show_selected()
+
+    # --- Timestamps ---
+
+    def open_import(self):
+        if not self.info or self.busy:
+            return
+        text = timestamps.best_source(self.info.tags)
+        if text:
+            source = ("These timestamps were in the video's description. Change them if you "
+                      "like, then press Make parts. Your current parts are replaced "
+                      "(Ctrl+Z brings them back).")
+        else:
+            try:
+                clip = self.clipboard_get()
+            except tk.TclError:
+                clip = ""
+            text = clip if len(timestamps.parse(clip)) >= 2 else ""
+            source = ("Paste a list of times, one per line, like “4:38 Zelda's Lullaby” (as "
+                      "in video descriptions), then press Make parts. Your current parts are "
+                      "replaced (Ctrl+Z brings them back).")
+        ImportDialog(self, text, source)
+
+    def import_times(self, found: list[tuple[float, str]]):
+        parts = parts_from_times(self.info, found)
+        if not parts:
+            self.status.configure(text="None of those times are inside the video.")
+            return
+        self._remember()
+        self.parts = parts
+        self.shown_part = None
+        self._changed(select=parts[0])
+        self.status.configure(text=f"Made {len(parts)} parts from the timestamps. "
+                                   "Ctrl+Z undoes that.")
+
+    def copy_times(self):
+        used = [p for p in self.parts if p.use]
+        if not used:
+            return
+        text = "\n".join(f"{timestamps.stamp(p.start)} {p.title}" for p in used)
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status.configure(text=f"Copied {len(used)} timestamps, ready to paste.")
 
     # --- The selected part ---
 
@@ -1062,6 +1417,7 @@ class App(BaseTk):
         if part is not self.shown_part:
             self.shown_part = part
             self.player.seek(part.start)  # carries on playing if it was
+            self.timeline.follow(part.start)
         self._draw_timelines()
         self._update_time()
         self._sync()
@@ -1072,6 +1428,7 @@ class App(BaseTk):
         part = self._current()
         if not part or self.busy or self.title_var.get() == part.title:
             return
+        self._remember(("title", id(part)))
         part.title = self.title_var.get()
         names = self._names()
         for other in self.parts:  # a clash can change another part's file name too
@@ -1079,6 +1436,8 @@ class App(BaseTk):
                 values = list(self.tree.item(other.iid, "values"))
                 values[2], values[6] = other.title, names.get(other, "not saved")
                 self.tree.item(other.iid, values=values)
+        self.timeline.draw()
+        self._project_changed()
 
     def _commit_time(self, side: str):
         part, info = self._current(), self.info
@@ -1093,7 +1452,7 @@ class App(BaseTk):
             self.time_vars[side].set(fmt_time(getattr(part, side)))
             self.bell()
             return
-        self._move(part, side, engine.snap(info, min(t, info.duration)), asked=t)
+        self.move_cut(part, side, engine.snap(info, min(t, info.duration)), asked=t)
 
     def _step_cut(self, side: str, direction: int):
         part, info = self._current(), self.info
@@ -1102,7 +1461,7 @@ class App(BaseTk):
         now = getattr(part, side)
         t = engine.next_keyframe(info, now) if direction > 0 \
             else engine.previous_keyframe(info, now)
-        self._move(part, side, t)
+        self.move_cut(part, side, t)
         return "break"
 
     def _cut_here(self, side: str):
@@ -1112,29 +1471,52 @@ class App(BaseTk):
             return
         asked = self.position if side == "start" else \
             min(self.position + self.player.frame_duration, info.duration)
-        self._move(part, side, engine.snap(info, asked), asked=asked)
+        self.move_cut(part, side, engine.snap(info, asked), asked=asked)
 
-    def _move(self, part: Part, side: str, t: float, asked: float | None = None):
+    def move_cut(self, part: Part, side: str, t: float, asked: float | None = None):
+        """Move one end of a part (t already on a keyframe), and with "Keep touching
+        parts joined", the neighbour that shares that cut."""
+        if part not in self.parts:
+            return
+        old = getattr(part, side)
         other = part.end if side == "start" else part.start
         if (side == "start" and t >= other - EPS) or (side == "end" and t <= other + EPS):
             self.status.configure(text="A part has to end after it starts.")
-            self.time_vars[side].set(fmt_time(getattr(part, side)))
+            self.time_vars[side].set(fmt_time(old))
             self.bell()
             return
+        if abs(t - old) <= EPS:
+            self.time_vars[side].set(fmt_time(old))
+            return
+        self._remember()
         setattr(part, side, t)
-        self._sorted()
-        self._refresh_parts()
-        self._select(part)
+        moved = 0
+        if self.joined_var.get():
+            for neighbour in self.parts:
+                if neighbour is part:
+                    continue
+                if side == "end" and abs(neighbour.start - old) <= EPS \
+                        and t < neighbour.end - EPS:
+                    neighbour.start = t
+                    moved += 1
+                elif side == "start" and abs(neighbour.end - old) <= EPS \
+                        and t > neighbour.start + EPS:
+                    neighbour.end = t
+                    moved += 1
+        self.shown_part = part
+        self._changed(select=part)
         # Show the cut: the part's first frame, or its last
         if side == "start":
             self.player.seek(t, pause=True)
         else:
             self.player.seek(t - self.player.frame_duration, pause=True)
+        notes = []
         if asked is not None and abs(asked - t) > EPS:
-            self.status.configure(text=f"{fmt_time(asked)} isn't a keyframe: the cut is at the "
-                                       f"nearest one, {fmt_time(t)}.")
-        else:
-            self.status.configure(text="")
+            notes.append(f"{fmt_time(asked)} isn't a keyframe: the cut is at the nearest one, "
+                         f"{fmt_time(t)}.")
+        if moved:
+            notes.append("The part next to it moved too.")
+        self.status.configure(text="  ".join(notes))
 
     # --- The player ---
 
@@ -1187,6 +1569,23 @@ class App(BaseTk):
         else:
             self.player.seek(part.end - self.player.frame_duration, pause=True)
 
+    def zoom_to_part(self):
+        part = self._current()
+        if part:
+            self.timeline.show(part.start, part.end)
+
+    def save_frame(self):
+        if not self.info or not self.info.has_video:
+            return
+        folder = Path(self.output_var.get().strip() or self.info.path.parent)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.status.configure(text=f"Can't make {folder}: {e}")
+            return
+        stamp = fmt_time(self.position).replace(":", ".")
+        self.player.save_frame(folder / f"{engine.safe_name(self.info.path.stem)} {stamp}.png")
+
     def redraw_soon(self):
         """Repaint the picture once the window has settled (Tk paints over it)."""
         if self.redraw_job:
@@ -1222,15 +1621,20 @@ class App(BaseTk):
         self.focus_force()
         self.redraw_soon()
 
-    def _timelines(self) -> list[Timeline]:
-        lines = [self.timeline]
+    def _overviews(self) -> list[Overview]:
+        bars = [self.overview]
         if self.full_screen:
-            lines.append(self.full_screen.timeline)
-        return lines
+            bars.append(self.full_screen.overview)
+        return bars
+
+    def overview_changed(self):
+        for bar in self._overviews():
+            bar.draw()
 
     def _draw_timelines(self):
-        for line in self._timelines():
-            line.draw()
+        for bar in self._overviews():
+            bar.draw()
+        self.timeline.draw()
 
     def _update_time(self):
         info = self.info
@@ -1246,8 +1650,11 @@ class App(BaseTk):
             self.part_time.configure(text="")
         if self.full_screen:
             self.full_screen.time_label.configure(text=text)
-        for line in self._timelines():
-            line.draw_playhead()
+        for bar in self._overviews():
+            bar.draw_playhead()
+        if self.playing:
+            self.timeline.follow(self.position)
+        self.timeline.draw_playhead()
 
     def _update_transport(self):
         symbol = "⏸" if self.playing else "▶"
@@ -1256,6 +1663,11 @@ class App(BaseTk):
             self.full_screen.play_btn.configure(text=symbol)
 
     # --- Where the parts go ---
+
+    def _save_as_changed(self):
+        label = self.save_as_var.get()
+        self.save_as = next(k for k, v in SAVE_AS.items() if v == label)
+        self._refresh_parts()
 
     def _browse_output(self):
         folder = filedialog.askdirectory(parent=self, title="Save the parts in",
@@ -1277,12 +1689,23 @@ class App(BaseTk):
             return
         self.focus_set()  # commits a time still being typed
         self.update_idletasks()
-        tracks = [i for i, on in self.track_use.items() if on]
         kinds = {t.index: t.kind for t in info.tracks}
-        if not any(kinds[i] in ("video", "audio", "subtitle") for i in tracks):
-            messagebox.showinfo("Splicer", "Check at least one picture, sound or subtitle "
-                                "track.", parent=self)
-            return
+        if self.save_as == "sound":
+            sound = self._sound_track()
+            if not sound:
+                messagebox.showinfo("Splicer", "Check a sound track to save (Tracks tab).",
+                                    parent=self)
+                return
+            ext = engine.sound_ext(sound)
+            tracks = [sound.index]
+            if ext in (".mka", ".m4a"):  # these can carry the cover art too
+                tracks += [i for i, on in self.track_use.items() if on and kinds[i] == "cover"]
+        else:
+            tracks = [i for i, on in self.track_use.items() if on]
+            if not any(kinds[i] in ("video", "audio", "subtitle") for i in tracks):
+                messagebox.showinfo("Splicer", "Check at least one picture, sound or subtitle "
+                                    "track (Tracks tab).", parent=self)
+                return
         used = [p for p in self.parts if p.use]
         if not used:
             messagebox.showinfo("Splicer", "Check at least one part.", parent=self)
@@ -1318,7 +1741,7 @@ class App(BaseTk):
         # Roughly what the parts will take: the video's size, by length
         need = sum(p.length for p in used) / max(info.duration, 1e-9) * info.path.stat().st_size
         free = shutil.disk_usage(folder).free + sum(d.stat().st_size for d in existing)
-        if need > free:
+        if need > free and self.save_as == "video":
             messagebox.showerror("Splicer", f"The parts need about {fmt_size(need)}, but "
                                  f"there's only {fmt_size(free)} free there.", parent=self)
             return
@@ -1330,18 +1753,22 @@ class App(BaseTk):
         total = sum(p.length for p, _ in jobs)
         self.status.configure(text=f"Splicing 1 of {len(jobs)}…")
         self._sync()
-        jobs = [(p.title, p.start, p.end, dest) for p, dest in jobs]
+        album = info.path.stem
+        jobs = [(p.title, p.start, p.end, dest,
+                 {"track": f"{n}/{len(jobs)}", "album": album}
+                 if self.save_as == "sound" else {})
+                for n, (p, dest) in enumerate(jobs, 1)]
 
         def work():
             done_length, written, failed = 0.0, [], []
-            for n, (title, start, end, dest) in enumerate(jobs, 1):
+            for n, (title, start, end, dest, tags) in enumerate(jobs, 1):
                 length = end - start
                 self.events.put(("part", n, len(jobs), dest.name))
                 try:
                     engine.cut(info, start, end, tracks, dest, title,
                                lambda f, base=done_length, length=length: self.events.put(
                                    ("progress", (base + f * length) / max(total, 1e-9))),
-                               self.cancel)
+                               self.cancel, tags=tags)
                     written.append(dest)
                 except engine.Cancelled:
                     self.events.put(("spliced", written, failed, True))
@@ -1393,13 +1820,18 @@ class App(BaseTk):
 
         for b in self.part_buttons:
             state(b, idle and loaded)
+        state(self.undo_btn, idle and loaded and bool(self.undo))
+        state(self.redo_btn, idle and loaded and bool(self.redo))
         for w in self.edit_widgets:
             state(w, idle and part is not None)
         for w in (self.output_entry, self.browse_btn, self.numbered_check):
             state(w, idle)
-        for w in self.transport:
+        self.save_as_box.state(["readonly", "!disabled"] if idle else ["disabled"])
+        for w in self.transport + self.zoom_buttons:
             state(w, loaded)
-        state(self.full_btn, loaded and self.info.has_video)
+        has_picture = loaded and self.info.has_video
+        state(self.full_btn, has_picture)
+        state(self.frame_btn, has_picture)
         state(self.splice_btn, idle and loaded and any(p.use for p in self.parts))
         state(self.cancel_btn, bool(self.busy))
         state(self.open_btn, idle and self.last_output is not None
@@ -1418,6 +1850,10 @@ class App(BaseTk):
                     self._update_transport()
                 elif kind == "loaded":
                     self.redraw_soon()
+                elif kind == "saved":
+                    self.last_output = event[1].parent
+                    self.status.configure(text=f"Saved the frame as {event[1]}")
+                    self._sync()
                 elif kind == "error":
                     self.status.configure(text=f"Player: {event[1]}")
                 elif kind == "reading" and event[1] == self.load_id:
@@ -1428,9 +1864,10 @@ class App(BaseTk):
                     self.progress.configure(value=0)
                     if event[2] is None:
                         self.file_detail.configure(text="Stopped.")
+                        self._refresh_all()
                     else:
                         self._loaded(event[2])
-                    self._refresh_all()
+                        self._sync()
                 elif kind == "read_failed" and event[1] == self.load_id:
                     self.busy = ""
                     self.progress.configure(value=0)
@@ -1457,6 +1894,7 @@ class App(BaseTk):
                                        "finished ones stay.", parent=self):
                 return
         self.cancel.set()
+        self._save_project_now()
         self.player.close()
         self._save()
         self.destroy()

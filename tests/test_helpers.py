@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from splicer.app import Part, file_names, fmt_time, parse_time
+from splicer import engine
+from splicer.app import Part, file_names, fmt_time, parse_time, parts_from_times
 
 
 @pytest.mark.parametrize("text, seconds", [
@@ -44,3 +45,10 @@ def test_file_names_clash():
 def test_file_names_width_grows():
     parts = [Part(f"P{n}", n, n + 1) for n in range(120)]
     assert file_names(parts, ".mkv", numbered=True)[parts[0]] == "001 - P0.mkv"
+
+
+def test_parts_from_times():
+    info = engine.probe(__import__("pathlib").Path(__file__).parent / "fixtures" / "chaptered.mkv")
+    parts = parts_from_times(info, [(0, "A"), (10, ""), (20, "C"), (99, "Past the end")])
+    assert [(p.title, p.start, p.end) for p in parts] == [
+        ("A", 0.0, 10.5), ("Part 2", 10.5, 19.5), ("C", 19.5, info.duration)]

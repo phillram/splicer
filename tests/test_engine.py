@@ -216,3 +216,23 @@ def test_no_tracks(mkv, tmp_path):
 ])
 def test_safe_name(name, safe):
     assert engine.safe_name(name) == safe
+
+
+def test_text_subtitles_and_tags_are_read(mkv):
+    assert [t.text for t in mkv.tracks] == [False, False, False, True, True, False]
+    lines = [(c.start, c.end, c.text) for c in mkv.subtitles[4]]
+    assert lines[0] == (1.0, 4.5, "Bonjour from part one")
+    assert lines[2] == (9.0, 13.0, "This one spans the cut at 10s")
+    assert mkv.tags.get("title") == "Test Movie"
+
+
+def test_sound_only(mkv, tmp_path):
+    track = mkv.tracks[1]
+    assert engine.sound_ext(track) == ".m4a"
+    s, e = engine.snap(mkv, 10), engine.snap(mkv, 20)
+    path = engine.cut(mkv, s, e, [track.index], tmp_path / "part.m4a", "Middle",
+                      tags={"track": "2/3", "album": "Test Movie"})
+    assert packets(path)[0] == packets(MKV, s, e)[1]
+    with av.open(str(path)) as c:
+        assert [st.type for st in c.streams] == ["audio"]
+        assert c.metadata.get("track") == "2/3" and c.metadata.get("album") == "Test Movie"

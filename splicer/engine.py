@@ -23,6 +23,8 @@ from typing import Callable
 
 import av
 
+from splicer.subtitles import TEXT_CODECS, Cue, packet_text, tidy
+
 # A hair under a millisecond: two times this close are the same moment
 EPS = 0.0005
 SUBTITLE_LOOKBACK = 10.0  # seconds
@@ -58,6 +60,7 @@ class Track:
     forced: bool = False
     detail: str = ""              # 3840×2160, 2 channels, a font's file name…
     chosen: bool = False          # what Splicer picks before you change anything
+    text: bool = False            # subtitles the player can show
 
     @property
     def label(self) -> str:
@@ -90,6 +93,8 @@ class Info:
     chapters: list[Chapter]
     keyframes: list[float] = field(default_factory=list)  # empty: cut anywhere
     has_video: bool = False
+    tags: dict = field(default_factory=dict)                  # the file's own details
+    subtitles: dict[int, list[Cue]] = field(default_factory=dict)  # text tracks' lines
 
     @property
     def title(self) -> str:
@@ -177,7 +182,15 @@ def _track(stream) -> Track:
         default=bool(disposition & av.stream.Disposition.default),
         forced=bool(disposition & av.stream.Disposition.forced),
         detail=detail,
+        text=kind == "subtitle" and codec_name(stream) in TEXT_CODECS,
     )
+
+
+def codec_name(stream) -> str:
+    try:
+        return stream.codec_context.name or ""
+    except Exception:
+        return ""
 
 
 def choose_defaults(tracks: list[Track]) -> None:
@@ -224,7 +237,8 @@ def probe(path: Path, progress: Callable[[float], None] | None = None,
         tracks = [_track(s) for s in container.streams]
         choose_defaults(tracks)
         chapters = _chapters(container, origin, duration)
-        info = Info(path, duration, origin, tracks, chapters)
+        info = Info(path, duration, origin, tracks, chapters,
+                    tags={k: v for k, v in container.metadata.items() if v})
 
         main = [s for s in container.streams.video
                 if not s.disposition & av.stream.Disposition.attached_pic]
@@ -234,8 +248,21 @@ def probe(path: Path, progress: Callable[[float], None] | None = None,
         video = main[0]
         size = max(path.stat().st_size, 1)
         keys = set()
+        # Text subtitles come along in the same pass, for the player to show
+        texts = {s.index: codec_name(s) for s in container.streams.subtitles
+                 if codec_name(s) in TEXT_CODECS}
+        cues: dict[int, list[Cue]] = {i: [] for i in texts}
+        streams = [video] + [container.streams[i] for i in texts]
         try:
-            for n, packet in enumerate(container.demux(video)):
+            for n, packet in enumerate(container.demux(*streams)):
+                index = packet.stream.index
+                if index in texts:
+                    if packet.size and packet.pts is not None:
+                        start = float(packet.pts * packet.time_base) - origin
+                        end = start + float((packet.duration or 0) * packet.time_base)
+                        cues[index].append(Cue(start, end, packet_text(texts[index],
+                                                                       bytes(packet))))
+                    continue
                 if packet.is_keyframe and packet.pts is not None:
                     keys.add(round(float(packet.pts * packet.time_base) - origin, 6))
                 if n % 500 == 0:
@@ -247,6 +274,7 @@ def probe(path: Path, progress: Callable[[float], None] | None = None,
             if not keys:
                 raise SpliceError(f"Can't read it: {e}") from None
         info.keyframes = sorted(max(k, 0.0) for k in keys)
+        info.subtitles = {i: tidy(c) for i, c in cues.items()}
         if not info.keyframes:
             info.keyframes = [0.0]
         if not duration:
@@ -313,7 +341,7 @@ def _clean_tags(tags: dict) -> dict:
 
 def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
         title: str = "", progress: Callable[[float], None] | None = None,
-        cancel: threading.Event | None = None) -> Path:
+        cancel: threading.Event | None = None, tags: dict | None = None) -> Path:
     """Copy the stretch from start to end (seconds, already on keyframes) of the
     chosen tracks into dest, a file of the same kind as the original. Written to
     a temporary name first, so a stopped or failed cut never leaves half a file."""
@@ -323,7 +351,7 @@ def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
     to_end = end >= info.duration - EPS
     try:
         _write(info, abs_start, abs_end, to_end, set(tracks), tmp, title,
-               end - start, progress, cancel)
+               end - start, progress, cancel, tags or {})
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -334,7 +362,8 @@ def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
     return dest
 
 
-def _write(info, abs_start, abs_end, to_end, chosen, tmp, title, length, progress, cancel):
+def _write(info, abs_start, abs_end, to_end, chosen, tmp, title, length, progress, cancel,
+           extra):
     with _open(info.path) as source:
         streams = [s for s in source.streams if s.index in chosen]
         if not streams:
@@ -347,6 +376,7 @@ def _write(info, abs_start, abs_end, to_end, chosen, tmp, title, length, progres
             tags = _clean_tags(dict(source.metadata))
             if title:
                 tags["title"] = title
+            tags.update(extra)
             output.metadata.update(tags)
             matroska = output.format.name == "matroska"
             mapping = {}
@@ -494,3 +524,15 @@ def _copy_packets(source, streams, mapping, output, abs_start, abs_end, to_end,
         raise SpliceError(f"Copying failed: {e}") from None
     if progress:
         progress(1.0)
+
+
+# --- Sound only --------------------------------------------------------------------
+
+SOUND_EXTS = {"opus": ".opus", "aac": ".m4a", "mp3": ".mp3", "flac": ".flac",
+              "vorbis": ".ogg", "alac": ".m4a"}
+
+
+def sound_ext(track: Track) -> str:
+    """The file a sound track goes into on its own, untouched: Opus in .opus, AAC
+    in .m4a, MP3 in .mp3, FLAC in .flac; anything else in .mka (Matroska sound)."""
+    return SOUND_EXTS.get(track.codec.lower(), ".mka")
