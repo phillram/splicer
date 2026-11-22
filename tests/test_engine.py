@@ -109,12 +109,6 @@ def test_sound_only_cuts_anywhere(tmp_path):
     assert engine.snap(info, 7.25) == 7.25
 
 
-def test_preview(mkv):
-    data = engine.preview(MKV, 10.5, mkv.origin, 160, 160)
-    assert data.startswith(b"P6 160 90 255 ")
-    assert len(data) == len(b"P6 160 90 255 ") + 160 * 90 * 3
-
-
 # --- Cutting -----------------------------------------------------------------------
 
 def test_parts_are_byte_identical(mkv, tmp_path):

@@ -1,5 +1,5 @@
-"""Everything Splicer does to a file: read what's in it, find its keyframes, draw a
-frame for the previews, and copy a stretch of it into a new file.
+"""Everything Splicer does to a file: read what's in it, find its keyframes, and
+copy a stretch of it into a new file.
 
 Nothing is ever decoded and re-encoded on the way to a new file: every packet of
 picture, sound and subtitles is copied over byte for byte. That's why a cut can
@@ -287,48 +287,6 @@ def next_keyframe(info: Info, t: float) -> float:
         return min(t + 1.0, info.duration)
     i = bisect.bisect_right(info.keyframes, t + EPS)
     return info.keyframes[i] if i < len(info.keyframes) else info.duration
-
-
-# --- Previews ----------------------------------------------------------------------
-
-def preview(path: Path, t: float, origin: float, width: int, height: int) -> bytes | None:
-    """The frame shown at t, as PPM image data fitted inside width × height.
-    None for a file with no picture."""
-    with _open(path) as container:
-        main = [s for s in container.streams.video
-                if not s.disposition & av.stream.Disposition.attached_pic]
-        if not main:
-            return None
-        stream = main[0]
-        stream.thread_type = "AUTO"
-        target = t + origin
-        container.seek(int(max(target, 0) * av.time_base), backward=True)
-        chosen = None
-        try:
-            for frame in container.decode(stream):
-                if frame.pts is None:
-                    continue
-                chosen = frame
-                if float(frame.pts * frame.time_base) >= target - EPS:
-                    break
-        except av.FFmpegError:
-            pass
-        if chosen is None:
-            return None
-        w, h = chosen.width, chosen.height
-        sar = getattr(stream, "sample_aspect_ratio", None)
-        if sar and sar.numerator and sar.denominator:
-            w = w * sar.numerator / sar.denominator
-        scale = min(width / w, height / h)
-        out_w, out_h = max(int(w * scale) // 2 * 2, 2), max(int(h * scale) // 2 * 2, 2)
-        rgb = chosen.reformat(width=out_w, height=out_h, format="rgb24")
-        plane = rgb.planes[0]
-        row = out_w * 3
-        data = bytes(plane)
-        if plane.line_size != row:  # padded rows
-            data = b"".join(data[y * plane.line_size:y * plane.line_size + row]
-                            for y in range(out_h))
-        return f"P6 {out_w} {out_h} 255 ".encode() + data
 
 
 # --- Names -------------------------------------------------------------------------
