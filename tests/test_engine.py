@@ -8,6 +8,7 @@ forced), one attached file, three chapters (0-10, 10-20, 20-24 s).
 from __future__ import annotations
 
 import hashlib
+from fractions import Fraction
 import threading
 from pathlib import Path
 
@@ -389,3 +390,35 @@ def test_mpeg_ts(tmp_path, exact):
     path = engine.cut(info, s, e, [0, 1], tmp_path / "part.ts", exact=exact)
     times = decoded_times(path)
     assert len(times) == round((e - s) * 30)
+
+
+def test_reencoded_pictures_have_durations(tmp_path):
+    # Encoders leave packet durations out; MP4 then drops the last picture
+    info = engine.probe(MP4)
+    path = engine.cut(info, 3.0, engine.snap_frame(info, 4.0), [0], tmp_path / "tail.mp4",
+                      exact=True)
+    with av.open(str(path)) as c:
+        assert all(p.duration for p in c.demux(video=0) if p.size)
+    assert len(decoded_times(path)) == 30
+
+
+def test_mpeg2_can_be_reencoded(tmp_path):
+    # MPEG-2 counts time in frames, unlike the 1/90000 of an MPEG-TS file
+    source = tmp_path / "m2.ts"
+    with av.open(str(MKV)) as c, av.open(str(source), "w") as o:
+        v = o.add_stream("mpeg2video", rate=30)
+        v.width, v.height, v.pix_fmt = 192, 108, "yuv420p"
+        v.codec_context.options = {"g": "45", "bf": "2"}
+        for n, frame in enumerate(c.decode(video=0)):
+            if frame.time >= 8:
+                break
+            frame.pts, frame.time_base = n, Fraction(1, 30)
+            for p in v.encode(frame):
+                o.mux(p)
+        for p in v.encode(None):
+            o.mux(p)
+    info = engine.probe(source)
+    assert engine.can_reencode(info) == ""
+    s, e = engine.snap_frame(info, 1.1), engine.snap_frame(info, 6.4)
+    path = engine.cut(info, s, e, [0], tmp_path / "part.ts", exact=True)
+    assert len(decoded_times(path)) == round((e - s) * 30)
