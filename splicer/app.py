@@ -53,22 +53,24 @@ PART_COLUMNS = (  # id, heading, width, anchor, stretch
     ("length", "Length", 80, "e", False),
 )
 
-SHORTCUTS = """Space  play / pause
-←  →  back / forward 5 seconds
-,  .  one frame back / forward
-Ctrl+←  Ctrl+→  keyframe before / after
-Home  End  start / last frame of the part
-Page Up  Page Down  previous / next part
-I  O  start / end the part at the current time
-Ctrl+Z  Ctrl+Y  undo / redo
-+  −  zoom the timeline in / out
-S  save the frame as a picture
-F  full screen (Esc to leave)
-M  mute
-
-On the timeline: drag a cut to move it, click to jump there,
-wheel to scroll, Ctrl+wheel to zoom.
-Shift+click a checkbox to check or uncheck all the parts up to it."""
+SHORTCUTS = (  # keys, what they do; then what the mouse does
+    ("Space", "Play / pause"),
+    ("← →", "Back / forward 5 seconds"),
+    (", .", "One frame back / forward"),
+    ("Ctrl+← Ctrl+→", "Keyframe before / after"),
+    ("Home End", "Start / last frame of the part"),
+    ("Page Up Page Down", "Previous / next part"),
+    ("I O", "Start / end the part at the current time"),
+    ("Ctrl+Z Ctrl+Y", "Undo / redo"),
+    ("Ctrl+A", "Select every part"),
+    ("+ −", "Zoom the timeline in / out"),
+    ("S", "Save the frame as a picture"),
+    ("F", "Full screen (Esc leaves)"),
+    ("M", "Mute"),
+)
+MOUSE = ("On the timeline, drag a cut to move it and click to jump there. The wheel "
+         "scrolls; Ctrl+wheel zooms. Shift+click a part's checkbox to check or uncheck "
+         "every part up to the last one you clicked.")
 
 
 @dataclass(eq=False)
@@ -576,9 +578,6 @@ class App(BaseTk):
         status.pack(side="bottom", fill="x")
         self.status = ttk.Label(status, text=f"Splicer {__version__}", style="Bar.TLabel")
         self.status.pack(side="left", fill="x", expand=True)
-        keys = ttk.Label(status, text="Shortcuts", style="Bar.TLabel", cursor="hand2")
-        keys.pack(side="right")
-        tip(keys, SHORTCUTS)
 
         # Parts and Tracks | Player, over the timeline: drag the gaps to resize
         self.outer = ttk.Panedwindow(self, orient="vertical")
@@ -619,6 +618,8 @@ class App(BaseTk):
         recent = ttk.Menubutton(row, text="Recent", menu=self.recent_menu)
         recent.pack(side="left", padx=(6, 0))
         tip(recent, "Videos you opened lately.")
+        tip(ttk.Button(row, text="Keyboard shortcuts", command=self.show_shortcuts),
+            "The keys, and what the mouse does on the timeline.").pack(side="right")
         names = ttk.Frame(row, style="Bar.TFrame")
         names.pack(side="left", fill="x", expand=True, padx=(12, 0))
         self.file_label = ttk.Label(names, text="No video open", style="BarStrong.TLabel")
@@ -719,7 +720,7 @@ class App(BaseTk):
         self.more_menu.add_separator()
         self.more_menu.add_command(label="Start again from the chapters",
                                    command=self._reset_parts)
-        more = ttk.Menubutton(head, text="More", menu=self.more_menu)
+        more = ttk.Menubutton(head, text="More", menu=self.more_menu, width=5)
         more.pack(side="right", padx=(4, 0))
         self.part_buttons.append(more)
         self.redo_btn = tip(ttk.Button(head, text="Redo",
@@ -849,13 +850,15 @@ class App(BaseTk):
         self.overview.pack(side="bottom", fill="x", pady=(6, 0))
         self.video = tk.Frame(box, bg="black", cursor="hand2")
         self.video.pack(fill="both", expand=True, pady=(4, 0))
-        self.placeholder = tk.Label(self.video, text="Open a video to watch it here.",
-                                    bg="black", fg=MUTED, font=("Segoe UI", 10))
+        self.placeholder = tk.Label(self.video, text="Click here to open a video, or drop one "
+                                    "on the window.", bg="black", fg=MUTED,
+                                    font=("Segoe UI", 10), cursor="hand2")
         self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        self.placeholder.bind("<ButtonRelease-1>", lambda e: self._video_clicked())
         self.video.bind("<Configure>", lambda e: self.redraw_soon())
         self.video.bind("<Expose>", lambda e: self.redraw_soon())
-        self.video.bind("<ButtonRelease-1>", lambda e: self.toggle_play())
-        self.video.bind("<Double-1>", lambda e: self.enter_full_screen())
+        self.video.bind("<ButtonRelease-1>", lambda e: self._video_clicked())
+        self.video.bind("<Double-1>", lambda e: self.info and self.enter_full_screen())
 
         row = ttk.Frame(controls)
         row.pack(fill="x")
@@ -2032,6 +2035,36 @@ class App(BaseTk):
         label = self.end_mode_var.get()
         self.end_mode = next(k for k, v in END_MODES.items() if v == label)
         self.player.set_end_mode(self.end_mode)
+
+    def _video_clicked(self):
+        """A click on the picture plays or pauses; with no video yet, opens one."""
+        if self.info:
+            self.toggle_play()
+        elif not self.busy:
+            self._choose_file()
+
+    def show_shortcuts(self):
+        if getattr(self, "shortcuts_window", None) and self.shortcuts_window.winfo_exists():
+            self.shortcuts_window.lift()
+            return
+        win = self.shortcuts_window = tk.Toplevel(self, bg=PANEL)
+        win.title("Keyboard shortcuts")
+        win.transient(self)
+        win.resizable(False, False)
+        dark_title_bar(win)
+        box = ttk.Frame(win, style="Tab.TFrame", padding=16)
+        box.pack(fill="both", expand=True)
+        for row, (keys, what) in enumerate(SHORTCUTS):
+            ttk.Label(box, text=keys, style="BarStrong.TLabel").grid(
+                row=row, column=0, sticky="w", padx=(0, 18), pady=1)
+            ttk.Label(box, text=what, style="Tab.TLabel").grid(row=row, column=1, sticky="w")
+        ttk.Label(box, text=MOUSE, style="TabNote.TLabel", wraplength=380, justify="left"
+                  ).grid(row=len(SHORTCUTS), column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Button(box, text="Close", command=win.destroy).grid(
+            row=len(SHORTCUTS) + 1, column=1, sticky="e", pady=(12, 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        win.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
 
     def toggle_play(self):
         if self.info:

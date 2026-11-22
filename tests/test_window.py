@@ -285,3 +285,25 @@ def test_a_click_leaves_the_box_being_typed_in(window, monkeypatch):
 def test_the_picture_is_left_to_the_player(window):
     # Tk painting the video black as the window changed size made it flash
     assert window.video.cget("bg") == ""
+
+
+def test_shortcuts_window(window):
+    a = window
+    a.show_shortcuts()
+    win = a.shortcuts_window
+    win.attributes("-alpha", 0.0)
+    a.show_shortcuts()  # a second click brings back the same one
+    assert a.shortcuts_window is win
+    win.destroy()
+
+
+def test_clicking_the_empty_player_opens_a_video(window, monkeypatch):
+    a = window
+    opened, toggled = [], []
+    monkeypatch.setattr(a, "_choose_file", lambda: opened.append(True))
+    monkeypatch.setattr(a, "toggle_play", lambda: toggled.append(True))
+    a._video_clicked()
+    assert toggled and not opened  # a video is open: play or pause
+    a.info = None
+    a._video_clicked()
+    assert opened
