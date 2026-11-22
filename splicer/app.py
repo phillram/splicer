@@ -40,6 +40,7 @@ UNDO_LIMIT = 200
 RECENT_LIMIT = 12
 
 END_MODES = {"stop": "Stop", "loop": "Loop the part", "continue": "Keep playing"}
+CUT_MODES = {"keyframes": "On keyframes (lossless)", "anywhere": "Anywhere (re-encodes near cuts)"}
 SAVE_AS = {"video": "Video", "sound": "Sound only"}
 
 PART_COLUMNS = (  # id, heading, width, anchor, stretch
@@ -236,13 +237,14 @@ def file_names(parts: list[Part], ext: str, numbered: bool) -> dict[Part, str]:
     return names
 
 
-def parts_from_times(info: Info, found: list[tuple[float, str]]) -> list[Part]:
+def parts_from_times(info: Info, found: list[tuple[float, str]], snap=None) -> list[Part]:
     """Parts from a timestamp list: each runs to the next time, the last to the end."""
+    snap = snap or (lambda t: engine.snap(info, t))
     parts = []
     found = [(t, title) for t, title in found if t < info.duration - EPS]
     for i, (t, title) in enumerate(found):
         end = found[i + 1][0] if i + 1 < len(found) else info.duration
-        start, end = engine.snap(info, t), engine.snap(info, end)
+        start, end = snap(t), snap(end)
         parts.append(Part(title or f"Part {i + 1}", start, end, use=end - start > EPS))
     return parts
 
@@ -395,6 +397,7 @@ class App(BaseTk):
         self.redo: list = []
         self.last_edit = None              # consecutive edits of one kind undo together
         self.subtitle_choices: dict[str, int | None] = {"Off": None}
+        self.cant_reencode = ""            # why this video's cuts must stay on keyframes
 
         self._style()
         self._build()
@@ -436,6 +439,7 @@ class App(BaseTk):
         self.settings["volume"] = int(self.volume_var.get())
         self.settings["end_mode"] = self.end_mode
         self.settings["save_as"] = self.save_as
+        self.settings["cut_mode"] = self.cut_mode
         try:
             self.settings["panes"] = [self.upper.sashpos(0), self.outer.sashpos(0)]
             self.settings.pop("sashes", None)  # 1.1's layout
@@ -611,6 +615,22 @@ class App(BaseTk):
         self.output_entry.pack(side="left", fill="x", expand=True, padx=6)
         self.browse_btn = ttk.Button(row, text="Browse…", command=self._browse_output)
         self.browse_btn.pack(side="left")
+        ttk.Label(row, text="Cuts", style="Bar.TLabel").pack(side="left", padx=(12, 4))
+        self.cut_mode = self.settings.get("cut_mode", "keyframes")
+        if self.cut_mode not in CUT_MODES:
+            self.cut_mode = "keyframes"
+        self.cut_mode_var = tk.StringVar(value=CUT_MODES[self.cut_mode])
+        self.cut_mode_box = ttk.Combobox(row, textvariable=self.cut_mode_var, state="readonly",
+                                         width=29, values=list(CUT_MODES.values()))
+        self.cut_mode_box.pack(side="left")
+        self.cut_mode_box.bind("<<ComboboxSelected>>", lambda e: self._cut_mode_changed())
+        tip(self.cut_mode_box,
+            "On keyframes: every part is an exact copy of the original, but cuts can only "
+            "go on keyframes, every few seconds.\n"
+            "Anywhere: cuts go on any frame. Between each cut and the keyframe beside it the "
+            "picture is re-encoded, in the same format at very high quality (it looks the "
+            "same; that's usually a second or two); everything else, and all of the sound, "
+            "is still an exact copy. The timeline marks the re-encoded bits in orange.")
         ttk.Label(row, text="as", style="Bar.TLabel").pack(side="left", padx=(12, 4))
         self.save_as = self.settings.get("save_as", "video")
         if self.save_as not in SAVE_AS:
@@ -741,21 +761,23 @@ class App(BaseTk):
             line.grid(row=r, column=1, sticky="w", pady=2)
             back = tip(ttk.Button(line, text="◀", style="Step.TButton",
                                   command=lambda s=side: self._step_cut(s, -1)),
-                       "Move to the keyframe before.")
+                       "Move back one cut point: a keyframe, or a frame when cuts can go "
+                       "anywhere.")
             back.pack(side="left")
             var = tk.StringVar()
             entry = ttk.Entry(line, textvariable=var, width=13, justify="center")
             entry.pack(side="left", padx=3)
             tip(entry, "Type a time (1:02:03.5, 4:38 or 278.2) and press Enter. It moves "
-                "to the nearest keyframe: a lossless cut can only happen there. "
-                "Up and Down step between keyframes.")
+                "to the nearest keyframe (or, when cuts can go anywhere, the nearest frame). "
+                "Up and Down step from one to the next.")
             for key in ("<Return>", "<KP_Enter>", "<FocusOut>"):
                 entry.bind(key, lambda e, s=side: self._commit_time(s))
             entry.bind("<Up>", lambda e, s=side: self._step_cut(s, 1))
             entry.bind("<Down>", lambda e, s=side: self._step_cut(s, -1))
             forward = tip(ttk.Button(line, text="▶", style="Step.TButton",
                                      command=lambda s=side: self._step_cut(s, 1)),
-                          "Move to the keyframe after.")
+                          "Move on one cut point: a keyframe, or a frame when cuts can go "
+                          "anywhere.")
             forward.pack(side="left")
             here = tip(ttk.Button(line, text="Use current time",
                                   command=lambda s=side: self._cut_here(s)),
@@ -1047,6 +1069,7 @@ class App(BaseTk):
         else:
             self.placeholder.configure(text="No picture: sound only.")
         self._remember_recent(info.path)
+        self.cant_reencode = engine.can_reencode(info)
         self.player.load(info.path, info.origin, info.duration, self._audio_track())
         restored = self._restore_project()
         if not restored:
@@ -1165,6 +1188,84 @@ class App(BaseTk):
         cues = self.info.subtitles.get(index) if self.info and index is not None else None
         self.player.set_subtitles(cues)
 
+    # --- Where cuts can go ---
+
+    @property
+    def anywhere(self) -> bool:
+        """Can cuts go on any frame (re-encoding near them) in this video?"""
+        return self.cut_mode == "anywhere" and self.info is not None and not self.cant_reencode
+
+    def snap(self, t: float) -> float:
+        """Where a cut asked for at t really goes: the nearest frame, or keyframe."""
+        return engine.snap_frame(self.info, t) if self.anywhere else engine.snap(self.info, t)
+
+    def step_point(self, t: float, direction: int) -> float:
+        """The cut point before or after t: a frame, or a keyframe."""
+        if self.anywhere:
+            return engine.next_frame(self.info, t) if direction > 0 \
+                else engine.previous_frame(self.info, t)
+        return engine.next_keyframe(self.info, t) if direction > 0 \
+            else engine.previous_keyframe(self.info, t)
+
+    def _chapter_parts(self, snap) -> list[Part]:
+        return [Part(ch.title, snap(ch.start), snap(ch.end),
+                     use=snap(ch.end) - snap(ch.start) > EPS) for ch in self.info.chapters]
+
+    def _cut_mode_changed(self):
+        label = self.cut_mode_var.get()
+        mode = next(k for k, v in CUT_MODES.items() if v == label)
+        if mode == self.cut_mode:
+            return
+        if mode == "anywhere" and self.cant_reencode:
+            self.cut_mode = mode
+            self.status.configure(text=self.cant_reencode)
+            self._refresh_parts()
+            return
+        before = self._snapshot()
+        untouched = self.info is not None and self.info.chapters and \
+            [(p.title, p.start, p.end) for p in self.parts] == \
+            [(p.title, p.start, p.end) for p in self._chapter_parts(
+                lambda t: engine.snap(self.info, t))]
+        self.cut_mode = mode
+        if not self.info or not self.parts:
+            self._refresh_parts()
+            return
+        if mode == "anywhere" and untouched:
+            self.undo.append(before)
+            self.redo.clear()
+            self.parts = self._chapter_parts(self.snap)
+            self.shown_part = None
+            self._changed(select=self.parts[0])
+            self.status.configure(text="Cuts can go anywhere now, and the parts start and end "
+                                       "exactly at the chapters.")
+            return
+        if mode == "keyframes":
+            moved = 0
+            for p in self.parts:
+                for attr in ("start", "end"):
+                    t = engine.snap(self.info, getattr(p, attr))
+                    moved += abs(t - getattr(p, attr)) > EPS
+                    setattr(p, attr, t)
+                for r in p.removed:
+                    for k in (0, 1):
+                        t = engine.snap(self.info, r[k])
+                        moved += abs(t - r[k]) > EPS
+                        r[k] = t
+                if p.end - p.start <= EPS:
+                    p.use = False
+            if moved:
+                self.undo.append(before)
+                self.redo.clear()
+            self._changed(select=self._current())
+            self.status.configure(
+                text=f"Cuts stay on keyframes now: {moved} moved to the nearest one. Ctrl+Z "
+                     "undoes that." if moved else "Cuts stay on keyframes now.")
+            return
+        self._refresh_parts()
+        self._show_selected()
+        self.status.configure(text="Cuts can go on any frame now. The bits re-encoded show in "
+                                   "orange on the timeline.")
+
     # --- Undo ---
 
     def _snapshot(self):
@@ -1220,7 +1321,7 @@ class App(BaseTk):
         if info.chapters:
             self.parts = []
             for ch in info.chapters:
-                start, end = engine.snap(info, ch.start), engine.snap(info, ch.end)
+                start, end = self.snap(ch.start), self.snap(ch.end)
                 self.parts.append(Part(ch.title, start, end, use=end - start > EPS))
         else:
             self.parts = [Part("Part 1", 0.0, info.duration)]
@@ -1367,11 +1468,11 @@ class App(BaseTk):
         if not info or not part or self.busy:
             return
         inside = lambda t: part.start + EPS < t < part.end - EPS  # noqa: E731
-        at = engine.snap(info, self.position)
+        at = self.snap(self.position)
         if not inside(at):
-            at = engine.snap(info, (part.start + part.end) / 2)
+            at = self.snap((part.start + part.end) / 2)
         if not inside(at):
-            keys = [k for k in info.keyframes if inside(k)]
+            keys = [k for k in (info.frames if self.anywhere else info.keyframes) if inside(k)]
             if not keys:
                 self.status.configure(text="There's no keyframe inside that part to split at.")
                 self.bell()
@@ -1427,14 +1528,17 @@ class App(BaseTk):
         if not info or not part or self.busy:
             return
         inside = lambda t: part.start + EPS < t < part.end - EPS  # noqa: E731
-        at = engine.snap(info, self.position)
+        at = self.snap(self.position)
         if not inside(at):
-            at = engine.snap(info, (part.start + part.end) / 2)
+            at = self.snap((part.start + part.end) / 2)
         if not inside(at):
-            at = engine.next_keyframe(info, part.start)
-        end = next((k for k in info.keyframes if k >= at + 2.5 - EPS), None)
-        if end is None or not end < part.end - EPS:
-            end = engine.next_keyframe(info, at)
+            at = self.step_point(part.start, 1)
+        if self.anywhere:
+            end = self.snap(min(at + 3.0, part.end - 0.5))
+        else:
+            end = next((k for k in info.keyframes if k >= at + 2.5 - EPS), None)
+            if end is None or not end < part.end - EPS:
+                end = engine.next_keyframe(info, at)
         if not (inside(at) and inside(end) and end > at + EPS):
             self.status.configure(text="This part is too short to cut a section out of: "
                                        "there aren't keyframes enough inside it.")
@@ -1464,7 +1568,7 @@ class App(BaseTk):
             self._fill_removed(part)
             return
         if abs(stretch[edge] - part.removed[i][edge]) <= EPS:
-            if asked is not None and abs(asked - t) > EPS:
+            if asked is not None and abs(asked - t) > EPS and not self.anywhere:
                 self._say_removed(part, f"{fmt_time(asked)} isn't a keyframe, and the nearest "
                                         f"one is {fmt_time(t)}, where it already is.")
             self._fill_removed(part)
@@ -1472,11 +1576,13 @@ class App(BaseTk):
         self._remember()
         part.removed[i] = stretch
         self.shown_part = part
-        if asked is not None and abs(asked - t) > EPS:
+        if asked is not None and abs(asked - t) > EPS and not self.anywhere:
             self._say_removed(part, f"{fmt_time(asked)} isn't a keyframe: it's at the nearest "
                                     f"one, {fmt_time(t)}.")
         else:
             self._say_removed(part, "")
+            self.status.configure(text=f"Leaves out {fmt_time(stretch[0])} to "
+                                       f"{fmt_time(stretch[1])} ({stretch[1] - stretch[0]:.2f} s).")
         self._changed(select=part)
         # Show the join: the last picture before the stretch, or the first after it
         if edge == 0:
@@ -1494,6 +1600,8 @@ class App(BaseTk):
     def _too_short(self, part: Part, i: int, edge: int, t: float, asked) -> str:
         """Why a stretch can't be made that short, and what it can be."""
         r0, r1 = part.removed[i]
+        if self.anywhere:
+            return "That would leave nothing out: a stretch left out has to end after it starts."
         wanted = fmt_time(asked) if asked is not None else fmt_time(t)
         other = "starts" if edge == 1 else "ends"
         between = [k for k in self.info.keyframes if r0 + EPS < k < r1 - EPS]
@@ -1502,7 +1610,7 @@ class App(BaseTk):
         if not between:
             return text + (f"There's no keyframe between {fmt_time(r0)} and {fmt_time(r1)}, so "
                            f"{r1 - r0:.2f} s is as short as a stretch here can be without "
-                           "re-encoding.")
+                           "re-encoding. To cut anywhere, set Cuts (at the top) to Anywhere.")
         return text + "It can end at " + ", ".join(fmt_time(k) for k in between[:4]) + "."
 
     def _say_removed(self, part: Part, text: str, error: bool = False):
@@ -1516,7 +1624,7 @@ class App(BaseTk):
             child.destroy()
         if not part:
             return
-        if part.removed:
+        if part.removed and not self.anywhere:
             keys = self.info.keyframes
             lo = min(r[0] for r in part.removed) - 8
             hi = max(r[1] for r in part.removed) + 8
@@ -1553,11 +1661,11 @@ class App(BaseTk):
                 entry.bind("<Up>", lambda e, i=i, edge=edge: self._step_removed(part, i, edge, 1))
                 entry.bind("<Down>",
                            lambda e, i=i, edge=edge: self._step_removed(part, i, edge, -1))
-                tip(entry, "Type a time and press Enter; Up and Down step between keyframes. "
-                    "Like every cut, it sits on a keyframe.")
+                tip(entry, "Type a time and press Enter; Up and Down step from one cut point "
+                    "to the next (keyframes, or frames when cuts can go anywhere).")
                 tip(ttk.Button(row, text="Now", style="Step.TButton",
                                command=lambda i=i, edge=edge: self.move_removed(
-                                   part, i, edge, engine.snap(self.info, self.position),
+                                   part, i, edge, self.snap(self.position),
                                    asked=self.position)),
                     "Use the current time in the player.").pack(side="left")
             ttk.Label(row, text=f"({r1 - r0:.2f} s)", style="TabNote.TLabel"
@@ -1577,14 +1685,12 @@ class App(BaseTk):
             var.set(fmt_time(part.removed[i][edge]))
             self.bell()
             return
-        self.move_removed(part, i, edge, engine.snap(self.info, t), asked=t)
+        self.move_removed(part, i, edge, self.snap(t), asked=t)
 
     def _step_removed(self, part: Part, i: int, edge: int, direction: int):
         if part in self.parts and i < len(part.removed):
             now = part.removed[i][edge]
-            t = engine.next_keyframe(self.info, now) if direction > 0 \
-                else engine.previous_keyframe(self.info, now)
-            self.move_removed(part, i, edge, t)
+            self.move_removed(part, i, edge, self.step_point(now, direction))
         return "break"
 
     def _remove_parts(self):
@@ -1622,7 +1728,7 @@ class App(BaseTk):
         ImportDialog(self, text, source)
 
     def import_times(self, found: list[tuple[float, str]]):
-        parts = parts_from_times(self.info, found)
+        parts = parts_from_times(self.info, found, self.snap)
         if not parts:
             self.status.configure(text="None of those times are inside the video.")
             return
@@ -1669,6 +1775,12 @@ class App(BaseTk):
             text=f"Length {fmt_time(part.length)}" + (
                 f"  ({gaps} stretch{'es' * (gaps != 1)} left out, the rest joined)"
                 if gaps else ""))
+        if self.anywhere:
+            redo = engine.reencoded(self.info, part.kept)
+            if redo > EPS:
+                self.length_label.configure(
+                    text=self.length_label.cget("text")
+                    + f"  ·  re-encodes {redo:.1f} s of picture near its cuts")
         self._fill_removed(part)
         self.side_notes["start"].configure(
             text="the start of the video" if part.start <= EPS else "")
@@ -1713,16 +1825,14 @@ class App(BaseTk):
             self.time_vars[side].set(fmt_time(getattr(part, side)))
             self.bell()
             return
-        self.move_cut(part, side, engine.snap(info, min(t, info.duration)), asked=t)
+        self.move_cut(part, side, self.snap(min(t, info.duration)), asked=t)
 
     def _step_cut(self, side: str, direction: int):
         part, info = self._current(), self.info
         if not part or not info or self.busy:
             return "break"
         now = getattr(part, side)
-        t = engine.next_keyframe(info, now) if direction > 0 \
-            else engine.previous_keyframe(info, now)
-        self.move_cut(part, side, t)
+        self.move_cut(part, side, self.step_point(now, direction))
         return "break"
 
     def _cut_here(self, side: str):
@@ -1732,7 +1842,7 @@ class App(BaseTk):
             return
         asked = self.position if side == "start" else \
             min(self.position + self.player.frame_duration, info.duration)
-        self.move_cut(part, side, engine.snap(info, asked), asked=asked)
+        self.move_cut(part, side, self.snap(asked), asked=asked)
 
     def move_cut(self, part: Part, side: str, t: float, asked: float | None = None):
         """Move one end of a part (t already on a keyframe), and with "Keep touching
@@ -1772,7 +1882,7 @@ class App(BaseTk):
         else:
             self.player.seek(t - self.player.frame_duration, pause=True)
         notes = []
-        if asked is not None and abs(asked - t) > EPS:
+        if asked is not None and abs(asked - t) > EPS and not self.anywhere:
             notes.append(f"{fmt_time(asked)} isn't a keyframe: the cut is at the nearest one, "
                          f"{fmt_time(t)}.")
         if moved:
@@ -2020,6 +2130,8 @@ class App(BaseTk):
                  if self.save_as == "sound" else {}, [tuple(r) for r in p.removed], p.length)
                 for n, (p, dest) in enumerate(jobs, 1)]
 
+        exact = self.anywhere and self.save_as == "video"
+
         def work():
             done_length, written, failed = 0.0, [], []
             for n, (title, start, end, dest, tags, removed, length) in enumerate(jobs, 1):
@@ -2028,7 +2140,9 @@ class App(BaseTk):
                     engine.cut(info, start, end, tracks, dest, title,
                                lambda f, base=done_length, length=length: self.events.put(
                                    ("progress", (base + f * length) / max(total, 1e-9))),
-                               self.cancel, tags=tags, removed=removed)
+                               self.cancel, tags=tags, removed=removed,
+                               exact=exact, note=lambda text, n=n, name=dest.name:
+                               self.events.put(("part", n, len(jobs), f"{name} ({text})")))
                     written.append(dest)
                 except engine.Cancelled:
                     self.events.put(("spliced", written, failed, True))
@@ -2088,6 +2202,7 @@ class App(BaseTk):
         for w in (self.output_entry, self.browse_btn, self.numbered_check):
             state(w, idle)
         self.save_as_box.state(["readonly", "!disabled"] if idle else ["disabled"])
+        self.cut_mode_box.state(["readonly", "!disabled"] if idle else ["disabled"])
         for w in self.transport + self.zoom_buttons:
             state(w, loaded)
         has_picture = loaded and self.info.has_video

@@ -215,6 +215,12 @@ class Timeline(tk.Canvas):
                                   fill=color, outline=FG if on else "", width=1)
             self.create_line(x0, self.LANE_TOP - 2, x0, lane_bottom + 2, fill=FG)
             self.create_line(x1, self.LANE_TOP - 2, x1, lane_bottom + 2, fill=FG)
+            if app.anywhere and part.use:
+                # The re-encoded bits, as an orange band along the bottom
+                for a, b in engine.reencoded_spans(info, part.kept):
+                    r0x, r1x = self.x(a), self.x(b)
+                    self.create_rectangle(r0x, lane_bottom - 6, max(r1x, r0x + 2), lane_bottom,
+                                          fill=WARN, width=0)
             for r0, r1 in part.removed:
                 c0, c1 = self.x(r0), self.x(r1)
                 self.create_rectangle(c0, self.LANE_TOP + 1, max(c1, c0 + 2), lane_bottom - 1,
@@ -336,7 +342,7 @@ class Timeline(tk.Canvas):
             self.app.seek(self.t(event.x), exact=False)
             return
         _, part, side, _ = self.drag
-        t = engine.snap(self.app.info, self.t(event.x))
+        t = self.app.snap(self.t(event.x))
         self.delete("ghost")
         x = self.x(t)
         self.create_line(x, 0, x, self.winfo_height(), fill=WARN, width=2, tags="ghost")

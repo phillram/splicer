@@ -2,9 +2,12 @@
 
 Cut a video into parts, losslessly. Windows only.
 
-Splicer never re-encodes anything. Every frame of picture, every bit of sound
-and every subtitle in a part is an exact copy of the original, so the parts look
-and sound identical to it and are written in seconds, even from a 4K video.
+Out of the box, Splicer never re-encodes anything. Every frame of picture,
+every bit of sound and every subtitle in a part is an exact copy of the
+original, so the parts look and sound identical to it and are written in
+seconds, even from a 4K video. If you'd rather cut on any frame, it can
+re-encode just the second or two of picture next to each cut, and nothing else:
+see [Where cuts can go](#where-cuts-can-go).
 
 Splicer never goes online. Everything it does happens on your PC.
 
@@ -127,23 +130,47 @@ To make one file from separate bits of the video, pick their parts in the list
 (Ctrl+click or Shift+click) and press **Join**: they become one part, with
 everything between them left out.
 
-A stretch left out starts and ends on keyframes too, so it can't be any length
-you like: in a video with a keyframe every three seconds or so, it's three
-seconds, or six, and so on. When you change it, it moves to the nearest
-keyframes, and the timeline shows them once you zoom in.
+With **Cuts: On keyframes**, a stretch left out starts and ends on keyframes
+too, so it can't be any length you like: in a video with a keyframe every three
+seconds or so, it's three seconds, or six, and so on. Under the stretch,
+Splicer lists the keyframes near it, and says why when a time you type can't
+be used. With **Cuts: Anywhere**, it can be any length.
 
-#### Why times move a little
+### Where cuts can go
 
-A video can only be cut without re-encoding at a **keyframe**, a frame that
-doesn't depend on the ones before it. Most videos have one every 1 to 10
-seconds. Chapter times, typed times, timestamps and current times all move to
-the nearest keyframe; when a time you gave moves, the status line at the bottom
-says where to. The times in the list are always exactly where the cuts will be.
+**Cuts**, along the top, has two settings.
 
-Parts that share a cut point join up exactly: nothing is lost between them and
-nothing appears twice.
+**On keyframes (lossless)**, the setting Splicer starts with. A video can only be
+cut without re-encoding at a **keyframe**, a frame that doesn't depend on the
+ones before it. Most videos have one every 1 to 10 seconds. Chapter times,
+typed times, timestamps and current times all move to the nearest keyframe;
+when a time you gave moves, Splicer says where to. Every part is an exact copy
+of the original.
 
-Files with sound and no picture can be cut anywhere.
+**Anywhere (re-encodes near cuts)**. A cut can go on any frame. Between a cut
+and the keyframe beside it (usually a second or two, at most the gap between
+keyframes), the picture is re-encoded: in the same format as the original, at
+the same size, with the same colors, at a quality high enough that it looks
+the same. Everything else is still copied exactly. The sound is never
+re-encoded: it's copied too, cut to within a fiftieth of a second, which you
+can't hear. The re-encoded bits show as orange bands along the bottom of the
+parts on the timeline, and the part's details say how many seconds there are.
+Re-encoding 4K takes a while: a few seconds to half a minute for each cut.
+
+Changing to **Anywhere** with the parts still as they came from the chapters
+moves them to the chapters' exact times. Changing back to **On keyframes**
+moves every cut to the nearest keyframe (Ctrl+Z undoes that). In Anywhere, the
+**◀** and **▶** buttons, and Up and Down in a time box, step a frame at a time.
+
+Splicer can re-encode H.264, HEVC, AV1, VP9, VP8, MPEG-2 and MPEG-4 video. For
+anything else, cuts stay on keyframes.
+
+The times in the list are always exactly where the cuts will be. Parts that
+share a cut point join up exactly: nothing is lost between them and nothing
+appears twice.
+
+Files with sound and no picture can always be cut anywhere, without
+re-encoding.
 
 ### Watching
 

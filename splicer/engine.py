@@ -23,6 +23,19 @@ from typing import Callable
 
 import av
 
+
+def _quiet_svt() -> None:
+    """SVT-AV1 (re-encoding near cuts) prints a banner each time unless SVT_LOG says
+    otherwise, read from the older C runtime's own copy of the environment."""
+    try:
+        import ctypes
+        ctypes.cdll.msvcrt._putenv(b"SVT_LOG=1")  # errors only
+    except (OSError, AttributeError):
+        pass
+
+
+_quiet_svt()
+
 from splicer.subtitles import TEXT_CODECS, Cue, packet_text, tidy
 
 # A hair under a millisecond: two times this close are the same moment
@@ -93,6 +106,8 @@ class Info:
     chapters: list[Chapter]
     keyframes: list[float] = field(default_factory=list)  # empty: cut anywhere
     has_video: bool = False
+    frames: list[float] = field(default_factory=list)  # every picture's time, in order
+    video_delay: float = 0.0       # how far decoding runs ahead of showing (B-frames)
     tags: dict = field(default_factory=dict)                  # the file's own details
     subtitles: dict[int, list[Cue]] = field(default_factory=dict)  # text tracks' lines
 
@@ -248,6 +263,8 @@ def probe(path: Path, progress: Callable[[float], None] | None = None,
         video = main[0]
         size = max(path.stat().st_size, 1)
         keys = set()
+        times: list[float] = []
+        delay = 0.0
         # Text subtitles come along in the same pass, for the player to show
         texts = {s.index: codec_name(s) for s in container.streams.subtitles
                  if codec_name(s) in TEXT_CODECS}
@@ -263,6 +280,11 @@ def probe(path: Path, progress: Callable[[float], None] | None = None,
                         cues[index].append(Cue(start, end, packet_text(texts[index],
                                                                        bytes(packet))))
                     continue
+                if packet.pts is not None:
+                    t = float(packet.pts * packet.time_base) - origin
+                    times.append(t)
+                    if packet.dts is not None:
+                        delay = max(delay, float((packet.pts - packet.dts) * packet.time_base))
                 if packet.is_keyframe and packet.pts is not None:
                     keys.add(round(float(packet.pts * packet.time_base) - origin, 6))
                 if n % 500 == 0:
@@ -274,6 +296,8 @@ def probe(path: Path, progress: Callable[[float], None] | None = None,
             if not keys:
                 raise SpliceError(f"Can't read it: {e}") from None
         info.keyframes = sorted(max(k, 0.0) for k in keys)
+        info.frames = sorted({round(max(t, 0.0), 6) for t in times})
+        info.video_delay = min(delay, 2.0)
         info.subtitles = {i: tidy(c) for i, c in cues.items()}
         if not info.keyframes:
             info.keyframes = [0.0]
@@ -299,6 +323,71 @@ def snap(info: Info, t: float) -> float:
     candidates = keys[max(i - 1, 0):i + 1] + ([info.duration] if i >= len(keys) - 1 else [])
     best = min(candidates, key=lambda k: (abs(k - t), k))
     return 0.0 if best <= EPS else best
+
+
+def snap_frame(info: Info, t: float) -> float:
+    """Where a cut asked for at t happens when cuts can go anywhere: the start of
+    the nearest picture (or t itself, for sound only)."""
+    if t <= EPS:
+        return 0.0
+    if t >= info.duration - EPS:
+        return info.duration
+    frames = info.frames
+    if not frames:
+        return t
+    i = bisect.bisect_left(frames, t)
+    candidates = frames[max(i - 1, 0):i + 1] + ([info.duration] if i >= len(frames) - 1 else [])
+    best = min(candidates, key=lambda f: (abs(f - t), f))
+    return 0.0 if best <= EPS else best
+
+
+def previous_frame(info: Info, t: float) -> float:
+    if not info.frames:
+        return max(t - 0.04, 0.0)
+    i = bisect.bisect_left(info.frames, t - EPS)
+    return info.frames[i - 1] if i > 0 else 0.0
+
+
+def next_frame(info: Info, t: float) -> float:
+    if not info.frames:
+        return min(t + 0.04, info.duration)
+    i = bisect.bisect_right(info.frames, t + EPS)
+    return info.frames[i] if i < len(info.frames) else info.duration
+
+
+def is_keyframe(info: Info, t: float) -> bool:
+    """Can a cut at t be a straight copy? (Always, without a picture.)"""
+    if not info.has_video or t <= EPS or t >= info.duration - EPS:
+        return True
+    i = bisect.bisect_left(info.keyframes, t - EPS)
+    return i < len(info.keyframes) and abs(info.keyframes[i] - t) <= EPS
+
+
+def reencoded_spans(info: Info, kept: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """The stretches of picture re-encoded to cut these kept stretches where they are:
+    from each cut that isn't on a keyframe to the keyframe beside it."""
+    if not info.has_video:
+        return []
+    spans = []
+    for start, end in kept:
+        first = next((k for k in info.keyframes if k >= start - EPS), None)
+        last = next((k for k in reversed(info.keyframes) if k <= end + EPS), None)
+        if end >= info.duration - EPS:
+            last = end
+        if first is None or last is None or first >= end - EPS or last <= start + EPS \
+                or first > last + EPS:
+            spans.append((start, end))
+            continue
+        if first - start > EPS:
+            spans.append((start, first))
+        if end - last > EPS:
+            spans.append((last, end))
+    return spans
+
+
+def reencoded(info: Info, kept: list[tuple[float, float]]) -> float:
+    """Seconds of picture re-encoded to cut these stretches where they are."""
+    return sum(e - s for s, e in reencoded_spans(info, kept))
 
 
 def previous_keyframe(info: Info, t: float) -> float:
@@ -357,12 +446,15 @@ def segments(start: float, end: float, removed=()) -> list[tuple[float, float]]:
 def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
         title: str = "", progress: Callable[[float], None] | None = None,
         cancel: threading.Event | None = None, tags: dict | None = None,
-        removed=()) -> Path:
+        removed=(), exact: bool = False,
+        note: Callable[[str], None] | None = None) -> Path:
     """Copy the stretch from start to end (seconds, already on keyframes) of the
     chosen tracks into dest, a file of the same kind as the original, leaving out
     any removed stretches (also on keyframes): what's left is joined seamlessly.
-    Written to a temporary name first, so a stopped or failed cut never leaves
-    half a file."""
+    With exact, the times can be anywhere: the pictures between a cut and the
+    nearest keyframe are re-encoded, at very high quality, in the same format;
+    everything else is still copied. Written to a temporary name first, so a
+    stopped or failed cut never leaves half a file."""
     dest = Path(dest)
     tmp = dest.with_name(f"{dest.stem}.splicing{dest.suffix}")
     kept = segments(start, end, removed)
@@ -372,7 +464,7 @@ def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
     spans = [(s + info.origin, e + info.origin, e >= info.duration - EPS) for s, e in kept]
     try:
         _write(info, spans, set(tracks), tmp, title,
-               sum(e - s for s, e in kept), progress, cancel, tags or {})
+               sum(e - s for s, e in kept), progress, cancel, tags or {}, exact, note)
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -383,7 +475,8 @@ def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
     return dest
 
 
-def _write(info, spans, chosen, tmp, title, length, progress, cancel, extra):
+def _write(info, spans, chosen, tmp, title, length, progress, cancel, extra, exact=False,
+           note=None):
     with _open(info.path) as source:
         streams = [s for s in source.streams if s.index in chosen]
         if not streams:
@@ -426,7 +519,17 @@ def _write(info, spans, chosen, tmp, title, length, progress, cancel, extra):
                     pass
                 mapping[s.index] = o
 
-            _copy_packets(source, streams, mapping, output, spans, length, progress, cancel)
+            redo = None
+            if exact and info.has_video:
+                main = next((st for st in streams if _kind(st) == "video"), None)
+                if main is not None and main.index in mapping:
+                    redo = Reencoder(info, main, mapping[main.index], output, note)
+            try:
+                _copy_packets(source, streams, mapping, output, spans, length, progress,
+                              cancel, redo)
+            finally:
+                if redo:
+                    redo.close()
 
 
 def _attached_files(source, streams) -> list[tuple[str, str, bytes]]:
@@ -459,7 +562,8 @@ def _attached_files(source, streams) -> list[tuple[str, str, bytes]]:
     return found
 
 
-def _copy_packets(source, streams, mapping, output, spans, length, progress, cancel):
+def _copy_packets(source, streams, mapping, output, spans, length, progress, cancel,
+                  redo=None):
     """Copy each stretch (absolute start, absolute end, runs to the file's end) in
     turn, the next one's timestamps carrying on where the last one stopped."""
     kinds = {s.index: _kind(s) for s in source.streams}
@@ -478,6 +582,14 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
             offset = start - written  # take this off a time to place it in the part
             finished: set[int] = set()
             started: set[int] = set()  # video tracks that have reached their first keyframe
+            # Where the main picture is copied; around that, it's re-encoded
+            copy_from, copy_to, tail = abs_start, abs_end, None
+            if redo is not None:
+                copy_from, copy_to, head, tail = redo.plan(abs_start, abs_end, to_end)
+                if head:
+                    redo.encode(head[0], head[1], offset, last_dts, cancel)
+                if copy_from is None:
+                    finished.add(redo.index)  # all of it re-encoded
             source.seek(int(max(abs_start - lookback, 0) * av.time_base), backward=True)
             for packet in source.demux():
                 if cancel is not None and cancel.is_set():
@@ -507,13 +619,18 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
                 if index not in mapping:
                     continue
                 if kind == "video":
+                    lo, hi = abs_start, abs_end
+                    if redo is not None and index == redo.index:
+                        if copy_from is None:
+                            continue
+                        lo, hi = copy_from, copy_to
                     if index not in started:
-                        if not packet.is_keyframe or float_t < abs_start - EPS:
+                        if not packet.is_keyframe or float_t < lo - EPS:
                             continue
                         started.add(index)
-                    if not to_end and packet.is_keyframe and float_t >= abs_end - EPS:
+                    if not to_end and packet.is_keyframe and float_t >= hi - EPS:
                         finished.add(index)
-                    if index in finished or float_t < abs_start - EPS:
+                    if index in finished or float_t < lo - EPS:
                         continue
                 else:
                     if not to_end and float_t >= abs_end - EPS:
@@ -530,6 +647,8 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
                             packet.pts = cut_ticks
                         else:
                             continue
+                if redo is not None and index == redo.index and redo.restore:
+                    packet = redo.restored(packet)
                 shift = int(round(offset / tb))
                 if packet.pts is not None:
                     packet.pts -= shift
@@ -558,11 +677,236 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
                     if done - last_report >= 0.005:
                         last_report = done
                         progress(done)
+            if tail:
+                redo.encode(tail[0], tail[1], offset, last_dts, cancel)
             written += Fraction(abs_end) - start
     except av.FFmpegError as e:
         raise SpliceError(f"Copying failed: {e}") from None
     if progress:
         progress(1.0)
+
+
+# --- Re-encoding the pictures next to a cut ---------------------------------------------
+
+# Encoders and settings that keep the result as close to the original as can be: a
+# very high quality, no reordered frames (so it joins the copied pictures cleanly), and
+# the format's own settings carried in the pictures themselves
+ENCODERS = {
+    "h264": ("libx264", {"crf": "8", "preset": "slow", "bf": "0", "x264-params":
+                         "bframes=0:keyint=infinite:scenecut=0:repeat-headers=1"}),
+    "hevc": ("libx265", {"crf": "8", "preset": "slow", "x265-params":
+                         "bframes=0:keyint=-1:scenecut=0:repeat-headers=1:log-level=error"}),
+    "av1": ("libsvtav1", {"crf": "8", "preset": "6", "svtav1-params": "keyint=-1"}),
+    "vp9": ("libvpx-vp9", {"crf": "4", "b": "0", "deadline": "good", "cpu-used": "2",
+                           "auto-alt-ref": "0", "lag-in-frames": "0"}),
+    "vp8": ("libvpx", {"crf": "4", "b": "50M", "deadline": "good", "cpu-used": "1",
+                       "auto-alt-ref": "0", "lag-in-frames": "0"}),
+    "mpeg2video": ("mpeg2video", {"qscale": "2", "bf": "0"}),
+    "mpeg4": ("mpeg4", {"qscale": "2", "bf": "0"}),
+}
+
+
+def can_reencode(info: Info) -> str:
+    """"" if cuts can go anywhere in this video; otherwise why not."""
+    if not info.has_video:
+        return ""
+    with _open(info.path) as c:
+        main = next((s for s in c.streams.video
+                     if not s.disposition & av.stream.Disposition.attached_pic), None)
+        name = codec_name(main) if main is not None else ""
+    name = {"libdav1d": "av1", "libaom-av1": "av1"}.get(name, name)
+    if name not in ENCODERS:
+        return f"Splicer can't re-encode {name or 'this'} video, so its cuts stay on keyframes."
+    return ""
+
+
+class Reencoder:
+    """Re-encodes the main picture for the bits of a part between a cut and the
+    nearest keyframe, and hands them to the output in place of the original."""
+
+    def __init__(self, info: Info, stream, out_stream, output, note=None):
+        self.info, self.index, self.out_stream, self.output = info, stream.index, out_stream, output
+        self.note = note
+        self.source = _open(info.path)
+        self.stream = self.source.streams[stream.index]
+        self.stream.thread_type = "AUTO"
+        self.tb = self.stream.time_base
+        name = codec_name(stream)
+        self.codec = {"libdav1d": "av1", "libaom-av1": "av1"}.get(name, name)
+        if self.codec not in ENCODERS:
+            self.source.close()
+            raise SpliceError(f"Splicer can't re-encode {self.codec or 'this'} video. Choose "
+                              "Keyframes only for this one.")
+        self.delay = int(round(Fraction(info.video_delay).limit_denominator(100000) / self.tb))
+        extra = bytes(stream.codec_context.extradata or b"")
+        # MP4 and Matroska store H.264/HEVC pictures as length-prefixed pieces; MPEG-TS
+        # and raw files keep the start codes the encoder writes
+        self.lengths = 0
+        if self.codec == "h264" and len(extra) > 4 and extra[0] == 1:
+            self.lengths = (extra[4] & 3) + 1
+        elif self.codec == "hevc" and len(extra) > 22 and extra[0] == 1:
+            self.lengths = (extra[21] & 3) + 1
+        rate = stream.average_rate or stream.guessed_rate
+        self.frame = float(1 / rate) if rate else 1 / 30
+        self.settings = self._original_settings(extra)
+        self.restore = False       # put them back on the next copied picture
+
+    def _original_settings(self, extra: bytes) -> bytes:
+        """The original's own format settings (H.264/HEVC parameter sets, the AV1
+        sequence header, the MPEG sequence header) as they'd appear in a picture.
+        A re-encoded piece brings its own; copied pictures after it need these
+        back."""
+        if not extra:
+            return b""
+        try:
+            if self.codec == "h264" and self.lengths:
+                units, i = [], 5
+                for count_at_mask in (0x1F, 0xFF):
+                    count = extra[i] & count_at_mask
+                    i += 1
+                    for _ in range(count):
+                        size = int.from_bytes(extra[i:i + 2], "big")
+                        units.append(extra[i + 2:i + 2 + size])
+                        i += 2 + size
+                return b"".join(len(u).to_bytes(self.lengths, "big") + u for u in units)
+            if self.codec == "hevc" and self.lengths:
+                units, i = [], 23
+                for _ in range(extra[22]):
+                    count = int.from_bytes(extra[i + 1:i + 3], "big")
+                    i += 3
+                    for _ in range(count):
+                        size = int.from_bytes(extra[i:i + 2], "big")
+                        units.append(extra[i + 2:i + 2 + size])
+                        i += 2 + size
+                return b"".join(len(u).to_bytes(self.lengths, "big") + u for u in units)
+            if self.codec == "av1":
+                return extra[4:]  # av1C's header, then the sequence header itself
+            if self.codec in ("h264", "hevc", "mpeg2video", "mpeg4"):
+                return extra      # already as it appears in the pictures
+        except IndexError:
+            return b""
+        return b""
+
+    def restored(self, packet):
+        """The first copied picture after a re-encoded piece, with the original's
+        settings in front of it."""
+        self.restore = False
+        if not self.settings:
+            return packet
+        out = av.Packet(self.settings + bytes(packet))
+        out.pts, out.dts, out.time_base = packet.pts, packet.dts, packet.time_base
+        out.is_keyframe = packet.is_keyframe
+        if packet.duration:
+            out.duration = packet.duration
+        return out
+
+    def close(self):
+        self.source.close()
+
+    def plan(self, start: float, end: float, to_end: bool):
+        """(copy from, copy to, re-encode head, re-encode tail), all absolute. copy
+        from is None when the whole stretch is re-encoded."""
+        origin, keys = self.info.origin, self.info.keyframes
+        first = next((k + origin for k in keys if k + origin >= start - EPS), None)
+        last = end if to_end else \
+            next((k + origin for k in reversed(keys) if k + origin <= end + EPS), None)
+        if first is None or last is None or first >= end - EPS or last <= start + EPS \
+                or first > last + EPS:
+            return None, None, (start, end), None
+        head = (start, first) if first - start > EPS else None
+        tail = (last, end) if end - last > EPS and not to_end else None
+        return first, last, head, tail
+
+    def _encoder(self):
+        name, options = ENCODERS[self.codec]
+        src = self.stream.codec_context
+        enc = av.CodecContext.create(name, "w")
+        enc.width, enc.height = src.width, src.height
+        formats = [f.name for f in (enc.codec.video_formats or [])]
+        enc.pix_fmt = src.pix_fmt if not formats or src.pix_fmt in formats else formats[0]
+        enc.time_base = self.tb
+        rate = self.stream.average_rate or self.stream.guessed_rate
+        if rate:
+            enc.framerate = rate
+        if src.sample_aspect_ratio:
+            enc.sample_aspect_ratio = src.sample_aspect_ratio
+        for attr in ("color_range", "color_primaries", "color_trc", "colorspace"):
+            try:
+                setattr(enc, attr, getattr(src, attr))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        enc.options = dict(options)
+        if self.codec in ("mpeg2video", "mpeg4"):
+            enc.bit_rate = max(int(src.bit_rate or 0) * 3, 40_000_000)
+            enc.options = {"bf": "0"}
+            enc.qmin, enc.qmax = 1, 3
+        return enc
+
+    def encode(self, start: float, end: float, offset: Fraction, last_dts: dict, cancel):
+        """Re-encode the pictures shown from start up to end (absolute seconds) and
+        write them, shifted by offset like everything copied around them."""
+        half = self.frame / 2
+        if self.note:
+            self.note(f"re-encoding {end - start:.1f} s of picture near a cut")
+        self.source.seek(int(max(start, 0) * av.time_base), backward=True)
+        enc = self._encoder()
+        shift = int(round(offset / self.tb))
+        try:
+            for frame in self.source.decode(self.stream):
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled
+                if frame.pts is None:
+                    continue
+                t = float(frame.pts * self.tb)
+                if t < start - half:
+                    continue
+                if t >= end - half:
+                    break
+                frame.pts -= shift
+                frame.pict_type = av.video.frame.PictureType.NONE
+                for packet in enc.encode(frame):
+                    self._write(packet, last_dts)
+            for packet in enc.encode(None):
+                self._write(packet, last_dts)
+            self.restore = True
+        except av.FFmpegError as e:
+            raise SpliceError(f"Re-encoding the picture near a cut failed: {e}") from None
+
+    def _write(self, packet, last_dts: dict):
+        if self.lengths:
+            packet = self._with_lengths(packet)
+        if packet.pts is not None:
+            packet.dts = packet.pts - self.delay  # in step with the copied pictures
+            if self.index in last_dts and packet.dts <= last_dts[self.index]:
+                packet.dts = last_dts[self.index] + 1
+            if packet.dts > packet.pts:
+                packet.pts = packet.dts
+            last_dts[self.index] = packet.dts
+        packet.stream = self.out_stream
+        self.output.mux(packet)
+
+    def _with_lengths(self, packet):
+        """Start codes (00 00 01) to the length-prefixed pieces the file uses."""
+        data = bytes(packet)
+        units, i, n = [], 0, len(data)
+        starts = []
+        while True:
+            j = data.find(b"\x00\x00\x01", i)
+            if j < 0:
+                break
+            starts.append(j + 3)
+            i = j + 3
+        for k, begin in enumerate(starts):
+            stop = starts[k + 1] - 3 if k + 1 < len(starts) else n
+            unit = data[begin:stop].rstrip(b"\x00") if k + 1 < len(starts) else data[begin:stop]
+            if unit:
+                units.append(len(unit).to_bytes(self.lengths, "big") + unit)
+        out = av.Packet(b"".join(units))
+        out.pts, out.dts, out.time_base = packet.pts, packet.dts, packet.time_base
+        out.is_keyframe = packet.is_keyframe
+        if packet.duration:
+            out.duration = packet.duration
+        return out
 
 
 # --- Sound only --------------------------------------------------------------------

@@ -275,3 +275,61 @@ def test_subtitles_across_a_join(mkv, tmp_path):
     # at 10.5 carries on from it, and the lines in the left-out stretches are gone
     assert lines == [(1.0, 2.0, "Bonjour from part one"),
                      (3.0, 2.5, "This one spans the cut at 10s")]
+
+
+# --- Cuts anywhere ------------------------------------------------------------------
+
+def test_frames_and_snapping(mkv):
+    assert len(mkv.frames) == 720 and mkv.frames[:3] == [0.0, 0.033, 0.067]
+    assert engine.snap_frame(mkv, 2.21) == 2.2 and engine.snap_frame(mkv, 2.22) == 2.233
+    assert engine.next_frame(mkv, 2.2) == 2.233 and engine.previous_frame(mkv, 2.2) == 2.167
+    assert engine.is_keyframe(mkv, 3.0) and not engine.is_keyframe(mkv, 2.2)
+    assert mkv.video_delay > 0  # B-frames
+
+
+def test_reencoded_spans(mkv):
+    # 2.2-11.7: picture re-encoded from 2.2 to the keyframe at 3.0, and from 10.5 to 11.7
+    spans = engine.reencoded_spans(mkv, [(2.2, 11.7)])
+    assert [(round(a, 3), round(b, 3)) for a, b in spans] == [(2.2, 3.0), (10.5, 11.7)]
+    assert engine.reencoded_spans(mkv, [(3.0, 10.5)]) == []
+    assert engine.reencoded_spans(mkv, [(4.6, 5.9)]) == [(4.6, 5.9)]  # no keyframe inside
+    assert engine.can_reencode(mkv) == ""
+
+
+def decoded_times(path):
+    with av.open(str(path)) as c:  # raises on anything it can't decode
+        return [float(f.pts * f.time_base) for f in c.decode(video=0)]
+
+
+@pytest.mark.parametrize("source, start, end, removed", [
+    (MKV, 2.2, 11.7, []),
+    (MP4, 2.2, 11.7, []),
+    (MKV, 0.7, 20.3, [(5.1, 8.4)]),
+    (MKV, 4.6, 5.9, []),            # inside one keyframe's stretch: all re-encoded
+    (MKV, 3.0, 10.5, []),           # on keyframes: nothing re-encoded
+])
+def test_cut_anywhere(tmp_path, source, start, end, removed):
+    info = engine.probe(source)
+    snap = lambda t: engine.snap_frame(info, t)  # noqa: E731
+    s, e = snap(start), snap(end)
+    rm = [(snap(a), snap(b)) for a, b in removed]
+    kept = engine.segments(s, e, rm)
+    path = engine.cut(info, s, e, [0, 1], tmp_path / f"exact{source.suffix}", removed=rm,
+                      exact=True)
+    times = decoded_times(path)
+    expected = sum(1 for f in info.frames for a, b in kept if a - 0.0005 <= f < b - 0.0005)
+    assert len(times) == expected
+    assert times == sorted(times) and times[0] < 0.01
+    # The sound is always a straight copy
+    sound = [h for a, b in kept for _, h in packets(source, a, b)[1]]
+    assert [h for _, h in packets(path)[1]] == sound
+
+
+def test_cut_anywhere_copies_between_keyframes(tmp_path):
+    info = engine.probe(MKV)
+    path = engine.cut(info, 2.2, 11.7, [0], tmp_path / "exact.mkv", exact=True)
+    copied = [h for _, h in packets(MKV, 3.0, 10.5)[0]]
+    out = [h for _, h in packets(path)[0]]
+    # The pictures from the keyframe at 3.0 to the one at 10.5 are the originals,
+    # bar the format settings put back in front of the first of them
+    assert out[25:24 + len(copied)] == copied[1:]
