@@ -253,7 +253,9 @@ def probe(path: Path, progress: Callable[[float], None] | None = None,
         else:
             duration = max((float(s.duration * s.time_base) for s in container.streams
                             if s.duration), default=0.0)
-        tracks = [_track(s) for s in container.streams]
+        # Data tracks (MP4 chapter text, timecodes) aren't offered: they can't be copied
+        # into a part, and the chapters come through anyway
+        tracks = [_track(s) for s in container.streams if _kind(s) != "data"]
         choose_defaults(tracks)
         chapters = _chapters(container, origin, duration)
         info = Info(path, duration, origin, tracks, chapters,
@@ -421,7 +423,7 @@ def safe_name(name: str) -> str:
     name = _BAD.sub(lambda m: {":": " -", '"': "'", "/": "-", "\\": "-", "|": "-"}
                     .get(m.group(), ""), name)
     name = re.sub(r"\s+", " ", name).strip().rstrip(". ")
-    if re.fullmatch(r"(?i)(con|prn|aux|nul|com\d|lpt\d)(\..*)?", name):
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|conin\$|conout\$|(com|lpt)[\d¹²³])(\..*)?", name):
         name = "_" + name
     return name[:180] or "Part"
 
@@ -835,6 +837,8 @@ class Reencoder:
             self.lengths = (extra[21] & 3) + 1
         rate = stream.average_rate or stream.guessed_rate
         self.frame = float(1 / rate) if rate else 1 / 30
+        # MPEG-2 only counts time in frames; everything else takes the file's own units
+        self.enc_tb = Fraction(rate.denominator, rate.numerator)             if self.codec == "mpeg2video" and rate else self.tb
         self.settings = self._original_settings(extra)
         self.restore = False       # put them back on the next copied picture
 
@@ -911,7 +915,7 @@ class Reencoder:
         enc.width, enc.height = src.width, src.height
         formats = [f.name for f in (enc.codec.video_formats or [])]
         enc.pix_fmt = src.pix_fmt if not formats or src.pix_fmt in formats else formats[0]
-        enc.time_base = self.tb
+        enc.time_base = self.enc_tb
         rate = self.stream.average_rate or self.stream.guessed_rate
         if rate:
             enc.framerate = rate
@@ -954,6 +958,9 @@ class Reencoder:
                     frame = frame.reformat(format=enc.pix_fmt)
                     frame.pts = pts
                 frame.pts -= shift
+                if self.enc_tb != self.tb:
+                    frame.pts = int(round(frame.pts * self.tb / self.enc_tb))
+                    frame.time_base = self.enc_tb
                 frame.pict_type = av.video.frame.PictureType.NONE
                 for packet in enc.encode(frame):
                     self._write(packet, last_dts)
@@ -964,6 +971,18 @@ class Reencoder:
             raise SpliceError(f"Re-encoding the picture near a cut failed: {e}") from None
 
     def _write(self, packet, last_dts: dict):
+        if packet.time_base and packet.time_base != self.tb:  # MPEG-2's frame counting
+            ratio = packet.time_base / self.tb
+            for attr in ("pts", "dts", "duration"):
+                value = getattr(packet, attr)
+                if value is not None:
+                    setattr(packet, attr, int(round(value * ratio)))
+            packet.time_base = self.tb
+        if not packet.duration:
+            # Encoders leave it out; MP4 then counts the last picture as lasting no
+            # time, and players skip it
+            packet.duration = max(int(round(Fraction(self.frame).limit_denominator(1_000_000)
+                                            / self.tb)), 1)
         if self.lengths:
             packet = self._with_lengths(packet)
         if packet.pts is not None:

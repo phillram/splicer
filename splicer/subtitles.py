@@ -57,12 +57,18 @@ def tidy(cues: list[Cue]) -> list[Cue]:
     return cues
 
 
-def active(cues: list[Cue], starts: list[float], t: float) -> str:
-    """Everything on screen at t, oldest first. starts: [c.start for c in cues]."""
+def longest(cues: list[Cue]) -> float:
+    """How long the longest line stays on screen."""
+    return max((c.end - c.start for c in cues), default=0.0)
+
+
+def active(cues: list[Cue], starts: list[float], t: float,
+           longest_cue: float | None = None) -> str:
+    """Everything on screen at t, oldest first. starts: [c.start for c in cues];
+    longest_cue: longest(cues), worked out once, as it decides how far back to look."""
+    if longest_cue is None:
+        longest_cue = longest(cues)
     i = bisect.bisect_right(starts, t)
-    shown = []
-    # Lines can overlap; look back far enough to catch a long one still on screen
-    for cue in cues[max(0, i - 12):i]:
-        if cue.start <= t < cue.end:
-            shown.append(cue.text)
-    return "\n".join(shown)
+    # Lines can overlap: anything that started within the longest line's time of t
+    j = bisect.bisect_left(starts, t - longest_cue, 0, i)
+    return "\n".join(c.text for c in cues[j:i] if c.start <= t < c.end)

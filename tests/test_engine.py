@@ -8,6 +8,7 @@ forced), one attached file, three chapters (0-10, 10-20, 20-24 s).
 from __future__ import annotations
 
 import hashlib
+from fractions import Fraction
 import threading
 from pathlib import Path
 
@@ -165,8 +166,7 @@ def test_subtitle_on_screen_at_the_cut_carries_over(mkv, tmp_path):
 
 def test_mp4(tmp_path):
     info = engine.probe(MP4)
-    assert [t.kind for t in info.tracks] == ["video", "audio", "audio", "subtitle", "data"]
-    assert not info.tracks[4].chosen        # the chapter-title track
+    assert [t.kind for t in info.tracks] == ["video", "audio", "audio", "subtitle"]
     assert len(info.chapters) == 3
     s, e = engine.snap(info, 10), engine.snap(info, 20)
     tracks = [0, 1, 3]
@@ -212,6 +212,10 @@ def test_no_tracks(mkv, tmp_path):
     ('A: "B"/C\\D|E?*<>', "A - 'B'-C-D-E"),
     ("trailing dots...", "trailing dots"),
     ("CON", "_CON"),
+    ("CONIN$", "_CONIN$"),
+    ("conout$.txt", "_conout$.txt"),
+    ("COM¹", "_COM¹"),
+    ("Console", "Console"),
     ("", "Part"),
 ])
 def test_safe_name(name, safe):
@@ -389,3 +393,51 @@ def test_mpeg_ts(tmp_path, exact):
     path = engine.cut(info, s, e, [0, 1], tmp_path / "part.ts", exact=exact)
     times = decoded_times(path)
     assert len(times) == round((e - s) * 30)
+
+
+def test_reencoded_pictures_have_durations(tmp_path):
+    # Encoders leave packet durations out; MP4 then drops the last picture
+    info = engine.probe(MP4)
+    path = engine.cut(info, 3.0, engine.snap_frame(info, 4.0), [0], tmp_path / "tail.mp4",
+                      exact=True)
+    with av.open(str(path)) as c:
+        assert all(p.duration for p in c.demux(video=0) if p.size)
+    assert len(decoded_times(path)) == 30
+
+
+def test_mpeg2_can_be_reencoded(tmp_path):
+    # MPEG-2 counts time in frames, unlike the 1/90000 of an MPEG-TS file
+    source = tmp_path / "m2.ts"
+    with av.open(str(MKV)) as c, av.open(str(source), "w") as o:
+        v = o.add_stream("mpeg2video", rate=30)
+        v.width, v.height, v.pix_fmt = 192, 108, "yuv420p"
+        v.codec_context.options = {"g": "45", "bf": "2"}
+        for n, frame in enumerate(c.decode(video=0)):
+            if frame.time >= 8:
+                break
+            frame.pts, frame.time_base = n, Fraction(1, 30)
+            for p in v.encode(frame):
+                o.mux(p)
+        for p in v.encode(None):
+            o.mux(p)
+    info = engine.probe(source)
+    assert engine.can_reencode(info) == ""
+    s, e = engine.snap_frame(info, 1.1), engine.snap_frame(info, 6.4)
+    path = engine.cut(info, s, e, [0], tmp_path / "part.ts", exact=True)
+    assert len(decoded_times(path)) == round((e - s) * 30)
+
+
+def test_sound_only_with_cover_art(tmp_path):
+    # Cover art is checked by default, but .m4a can't carry it: the sound still saves
+    info = engine.probe(COVER)
+    sound = next(t for t in info.tracks if t.kind == "audio")
+    assert engine.sound_ext(sound) == ".m4a"
+    dest = tmp_path / "x.m4a"
+    engine.cut(info, 0, 2, [sound.index], dest)
+    assert dest.stat().st_size > 0
+
+
+def test_data_tracks_are_not_offered():
+    info = engine.probe(FIXTURES / "chaptered.mp4")
+    assert "data" not in [t.kind for t in info.tracks]
+    assert len(info.chapters) == 3
