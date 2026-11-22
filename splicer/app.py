@@ -526,6 +526,7 @@ class App(BaseTk):
         st.configure("Tab.TFrame", background=PANEL)
         st.configure("Tab.TLabel", background=PANEL)
         st.configure("TabNote.TLabel", background=PANEL, foreground=MUTED)
+        st.configure("TabWarn.TLabel", background=PANEL, foreground=WARN)
         st.configure("Tab.TCheckbutton", background=PANEL, indicatorbackground=FIELD,
                      indicatorforeground="white", indicatormargin=(0, 0, 4, 0))
         st.map("Tab.TCheckbutton", background=[("active", PANEL)],
@@ -1449,23 +1450,33 @@ class App(BaseTk):
                  "times below or drag its edges on the timeline; play across it to see the "
                  "join.")
 
-    def move_removed(self, part: Part, i: int, edge: int, t: float):
-        """Move one edge (0: from, 1: to) of a stretch left out of a part."""
+    def move_removed(self, part: Part, i: int, edge: int, t: float,
+                     asked: float | None = None):
+        """Move one edge (0: from, 1: to) of a stretch left out of a part. t is on a
+        keyframe; asked is the time typed (or showing), if it was something else."""
         if part not in self.parts or i >= len(part.removed):
             return
         stretch = list(part.removed[i])
         stretch[edge] = min(max(t, part.start), part.end)
         if stretch[1] - stretch[0] <= EPS:
-            self.status.configure(text="A stretch left out has to end after it starts.")
+            self._say_removed(part, self._too_short(part, i, edge, t, asked), error=True)
             self.bell()
             self._fill_removed(part)
             return
         if abs(stretch[edge] - part.removed[i][edge]) <= EPS:
+            if asked is not None and abs(asked - t) > EPS:
+                self._say_removed(part, f"{fmt_time(asked)} isn't a keyframe, and the nearest "
+                                        f"one is {fmt_time(t)}, where it already is.")
             self._fill_removed(part)
             return
         self._remember()
         part.removed[i] = stretch
         self.shown_part = part
+        if asked is not None and abs(asked - t) > EPS:
+            self._say_removed(part, f"{fmt_time(asked)} isn't a keyframe: it's at the nearest "
+                                    f"one, {fmt_time(t)}.")
+        else:
+            self._say_removed(part, "")
         self._changed(select=part)
         # Show the join: the last picture before the stretch, or the first after it
         if edge == 0:
@@ -1480,12 +1491,51 @@ class App(BaseTk):
             self.shown_part = part
             self._changed(select=part)
 
+    def _too_short(self, part: Part, i: int, edge: int, t: float, asked) -> str:
+        """Why a stretch can't be made that short, and what it can be."""
+        r0, r1 = part.removed[i]
+        wanted = fmt_time(asked) if asked is not None else fmt_time(t)
+        other = "starts" if edge == 1 else "ends"
+        between = [k for k in self.info.keyframes if r0 + EPS < k < r1 - EPS]
+        text = (f"{wanted} isn't a keyframe, and the nearest one is {fmt_time(t)}, where this "
+                f"stretch {other}, so nothing would be left out. ")
+        if not between:
+            return text + (f"There's no keyframe between {fmt_time(r0)} and {fmt_time(r1)}, so "
+                           f"{r1 - r0:.2f} s is as short as a stretch here can be without "
+                           "re-encoding.")
+        return text + "It can end at " + ", ".join(fmt_time(k) for k in between[:4]) + "."
+
+    def _say_removed(self, part: Part, text: str, error: bool = False):
+        self.removed_message = (part, text, error)
+        if text:
+            self.status.configure(text=text)
+
     def _fill_removed(self, part: Part | None):
         box = self.removed_box
         for child in box.winfo_children():
             child.destroy()
         if not part:
             return
+        if part.removed:
+            keys = self.info.keyframes
+            lo = min(r[0] for r in part.removed) - 8
+            hi = max(r[1] for r in part.removed) + 8
+            near = [fmt_time(k) for k in keys if max(lo, part.start) <= k <= min(hi, part.end)]
+            if near:
+                hint = ttk.Label(box, style="TabNote.TLabel", justify="left",
+                                 text="A stretch left out starts and ends on keyframes. Near here "
+                                      "they're at " + ", ".join(near[:10])
+                                      + ("…" if len(near) > 10 else "") + ".")
+                hint.pack(anchor="w", fill="x", pady=(4, 0), side="bottom")
+                hint.bind("<Configure>",
+                          lambda e, w=hint: w.configure(wraplength=max(e.width - 4, 100)))
+        part_said, text, error = getattr(self, "removed_message", (None, "", False))
+        if part_said is part and text:
+            said = ttk.Label(box, text=text, style="TabWarn.TLabel" if error else "TabNote.TLabel",
+                             justify="left")
+            said.pack(anchor="w", fill="x", pady=(4, 0), side="bottom")
+            said.bind("<Configure>",
+                      lambda e, w=said: w.configure(wraplength=max(e.width - 4, 100)))
         for i, (r0, r1) in enumerate(part.removed):
             row = ttk.Frame(box, style="Tab.TFrame")
             row.pack(anchor="w", pady=(4, 0))
@@ -1507,7 +1557,8 @@ class App(BaseTk):
                     "Like every cut, it sits on a keyframe.")
                 tip(ttk.Button(row, text="Now", style="Step.TButton",
                                command=lambda i=i, edge=edge: self.move_removed(
-                                   part, i, edge, engine.snap(self.info, self.position))),
+                                   part, i, edge, engine.snap(self.info, self.position),
+                                   asked=self.position)),
                     "Use the current time in the player.").pack(side="left")
             ttk.Label(row, text=f"({r1 - r0:.2f} s)", style="TabNote.TLabel"
                       ).pack(side="left", padx=6)
@@ -1526,7 +1577,7 @@ class App(BaseTk):
             var.set(fmt_time(part.removed[i][edge]))
             self.bell()
             return
-        self.move_removed(part, i, edge, engine.snap(self.info, t))
+        self.move_removed(part, i, edge, engine.snap(self.info, t), asked=t)
 
     def _step_removed(self, part: Part, i: int, edge: int, direction: int):
         if part in self.parts and i < len(part.removed):
