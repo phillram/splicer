@@ -29,6 +29,7 @@ FG, MUTED, ACCENT, WARN = "#e6e6e6", "#9a9ca3", "#5865f2", "#faa61a"
 SEGMENTS = ("#3c4270", "#4a5190")
 OFF_SEGMENT = "#34363c"
 CUT = "#141518"        # a stretch left out of a part
+WAVE = "#aeb4ff"       # the sound's shape
 EDGE_GRAB = 6  # pixels either side of a cut that pick it up
 
 STEPS = (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200)
@@ -220,28 +221,50 @@ class Timeline(tk.Canvas):
                 for a, b in engine.reencoded_spans(info, part.kept):
                     r0x, r1x = self.x(a), self.x(b)
                     self.create_rectangle(r0x, lane_bottom - 6, max(r1x, r0x + 2), lane_bottom,
-                                          fill=WARN, width=0)
+                                          fill=WARN, width=0, tags="over")
             for r0, r1 in part.removed:
                 c0, c1 = self.x(r0), self.x(r1)
                 self.create_rectangle(c0, self.LANE_TOP + 1, max(c1, c0 + 2), lane_bottom - 1,
-                                      fill=CUT, outline=WARN, dash=(3, 3))
+                                      fill=CUT, outline=WARN, dash=(3, 3), tags="over")
                 if c1 - c0 > 50:
                     self.create_text((c0 + c1) / 2, (self.LANE_TOP + lane_bottom) / 2,
-                                     text="left out", fill=WARN, font=self.small)
+                                     text="left out", fill=WARN, font=self.small, tags="over")
             room = min(x1, width) - max(x0, 0) - 10
             if room > 24:
                 text = self._fit_text(part.title, room)
                 self.create_text(max(x0, 0) + 5, self.LANE_TOP + 4, text=text, anchor="nw",
-                                 fill="white" if part.use else MUTED, font=self.label)
+                                 fill="white" if part.use else MUTED, font=self.label,
+                                 tags="over")
                 if room > 90:
                     self.create_text(max(x0, 0) + 5, lane_bottom - 3, anchor="sw",
-                                     text=clock(part.length, 1), fill=MUTED, font=self.small)
+                                     text=clock(part.length, 1), fill=MUTED, font=self.small,
+                                     tags="over")
         for ch in info.chapters:
             x = self.x(ch.start)
             if 0 <= x <= width:
                 self.create_line(x, self.RULER - 4, x, self.LANE_TOP, fill=WARN, width=2)
+        self._waveform(width, lane_bottom)
+        self.tag_raise("over")  # names and left-out stretches stay on top of it
         self._keyframes(width, lane_bottom)
         self.draw_playhead()
+
+    def _waveform(self, width: int, bottom: int):
+        """The sound's shape along the parts, so quiet gaps and loud bits show."""
+        peaks = getattr(self.app, "wave", None)
+        if not peaks:
+            return
+        top = self.LANE_TOP + 20  # below the part names
+        middle, half = (top + bottom) / 2, max((bottom - top) / 2 - 1, 2)
+        loudest = max(peaks) or 1.0
+        step, last = engine.WAVE_STEP, len(peaks)
+        for x in range(0, width, 2):
+            i0 = int(self.t(x) / step)
+            i1 = max(int(self.t(x + 2) / step), i0 + 1)
+            if i0 >= last:
+                break
+            level = max(peaks[i0:min(i1, last)]) / loudest
+            if level > 0.02:
+                self.create_line(x, middle - level * half, x, middle + level * half, fill=WAVE)
 
     def _ruler(self, width: int):
         self.create_rectangle(0, 0, width, self.RULER, fill=FIELD, width=0)

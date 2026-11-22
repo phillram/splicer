@@ -39,6 +39,9 @@ To change a part, select it and type new start and end times, or press
 timeline. **Add part**, **Split** and **Remove** do what they say. Uncheck a
 part to skip it. Everything can be undone with `Ctrl+Z`.
 
+The timeline along the bottom shows the sound's waveform, which makes the gaps
+between songs or scenes easy to spot. `Ctrl+wheel` zooms in.
+
 Splicer remembers your parts for each video, so you can close it and carry on
 later.
 
@@ -77,6 +80,7 @@ own description has one, it's filled in for you.
 
 - Parts go in a folder named after the video unless you pick another.
 - **Number the files** gives you `01 - Intro.mkv`, `02 - …`.
+- A part that spans several of the original chapters keeps them.
 - **Save as: Sound only** saves just the audio, untouched (`.opus`, `.m4a`,
   `.mp3`, `.flac` and so on), numbered like album tracks.
 - **Save frame** (`S`) saves the current picture as a full-size PNG.

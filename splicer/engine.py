@@ -13,6 +13,7 @@ are seconds from the start of the video as a player shows it.
 from __future__ import annotations
 
 import bisect
+from array import array
 import os
 import re
 import threading
@@ -168,7 +169,7 @@ def _track(stream) -> Track:
     else:
         try:
             ctx = stream.codec_context
-            codec = ctx.name or ""
+            codec = codec_name(stream)
         except Exception:
             codec = ""
         codec = codec.upper() if codec in ("aac", "ac3", "eac3", "dts", "flac", "mp3", "alac") \
@@ -176,7 +177,7 @@ def _track(stream) -> Track:
                   "vp9": "VP9", "vp8": "VP8", "opus": "Opus", "vorbis": "Vorbis",
                   "subrip": "SRT", "srt": "SRT", "ass": "ASS", "hdmv_pgs_subtitle": "PGS",
                   "dvd_subtitle": "VobSub", "mov_text": "MP4 text", "webvtt": "WebVTT",
-                  "mjpeg": "JPEG", "png": "PNG", "truehd": "TrueHD",
+                  "mjpeg": "JPEG", "png": "PNG", "truehd": "TrueHD", "dts": "DTS", "mp2": "MP2",
                   "mpeg2video": "MPEG-2", "mpeg4": "MPEG-4"}.get(codec, codec)
         if kind == "video":
             ctx = stream.codec_context
@@ -202,8 +203,11 @@ def _track(stream) -> Track:
 
 
 def codec_name(stream) -> str:
+    """The codec's own name (mp3, dts, av1), not the decoder's (mp3float, dca,
+    libdav1d)."""
     try:
-        return stream.codec_context.name or ""
+        codec = stream.codec_context.codec
+        return getattr(codec, "canonical_name", "") or codec.name or ""
     except Exception:
         return ""
 
@@ -428,6 +432,52 @@ def _clean_tags(tags: dict) -> dict:
     return {k: v for k, v in tags.items() if not STALE_TAGS.match(k)}
 
 
+def part_chapters(info: Info, kept: list[tuple[float, float]]) -> list[tuple[float, float, str]]:
+    """The original chapters that fall in a part, placed in the part's own time
+    (stretches left out taken away). Only when there are two or more: a part that's
+    one chapter needs none."""
+    def inside(t: float) -> float:
+        return sum(min(max(t - a, 0.0), b - a) for a, b in kept)
+    if not kept:
+        return []
+    found = []
+    for ch in info.chapters:
+        a, b = inside(max(ch.start, kept[0][0])), inside(min(ch.end, kept[-1][1]))
+        if b - a > 1.0:
+            found.append((a, b, ch.title))
+    return found if len(found) > 1 else []
+
+
+def seek_before(container, stream, want: float, margin: float = 0.0) -> None:
+    """Seek so reading starts at or before want (absolute seconds), a margin earlier
+    still. Matroska and MP4 land where asked; MPEG-TS seeks by decoding time and can
+    land well after it, so peek at the first keyframe and step further back until it
+    comes in time. Without a picture to go by, just seek."""
+    step = 1.0
+    while True:
+        target = max(want - margin, 0.0)
+        container.seek(int(target * av.time_base), backward=True)
+        if stream is None or target <= 0:
+            return
+        # Decoding starts at the first keyframe read, not just the first picture
+        first = None
+        for n, packet in enumerate(container.demux(stream)):
+            if packet.pts is not None and packet.is_keyframe:
+                first = float(packet.pts * packet.time_base)
+                break
+            if n > 5000:
+                break
+        container.seek(int(target * av.time_base), backward=True)  # back to the start
+        if first is None or first <= want + EPS or margin > 300:
+            return
+        margin += step
+        step *= 2
+
+
+def _copies_picture(info: Info, tracks) -> bool:
+    return any(t.kind == "video" and t.index in set(tracks) for t in info.tracks)
+
+
 def segments(start: float, end: float, removed=()) -> list[tuple[float, float]]:
     """What's kept of start..end once the removed stretches are taken out."""
     kept, at = [], start
@@ -457,14 +507,21 @@ def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
     stopped or failed cut never leaves half a file."""
     dest = Path(dest)
     tmp = dest.with_name(f"{dest.stem}.splicing{dest.suffix}")
+    if not exact and info.has_video and _copies_picture(info, tracks):
+        # Copying the picture can only start on a keyframe: put every cut on one, or
+        # the sound would start before the picture does
+        start, end = snap(info, start), snap(info, end)
+        removed = [(snap(info, a), snap(info, b)) for a, b in removed]
     kept = segments(start, end, removed)
     if not kept:
         raise SpliceError("Nothing is left of this part once the removed stretches are "
                           "taken out.")
     spans = [(s + info.origin, e + info.origin, e >= info.duration - EPS) for s, e in kept]
     try:
+        info_chapters = part_chapters(info, kept)
         _write(info, spans, set(tracks), tmp, title,
-               sum(e - s for s, e in kept), progress, cancel, tags or {}, exact, note)
+               sum(e - s for s, e in kept), progress, cancel, tags or {}, exact, note,
+               info_chapters)
         os.replace(tmp, dest)
     except BaseException:
         try:
@@ -476,7 +533,7 @@ def cut(info: Info, start: float, end: float, tracks: list[int], dest: Path,
 
 
 def _write(info, spans, chosen, tmp, title, length, progress, cancel, extra, exact=False,
-           note=None):
+           note=None, chapters=()):
     with _open(info.path) as source:
         streams = [s for s in source.streams if s.index in chosen]
         if not streams:
@@ -491,6 +548,14 @@ def _write(info, spans, chosen, tmp, title, length, progress, cancel, extra, exa
                 tags["title"] = title
             tags.update(extra)
             output.metadata.update(tags)
+            if chapters:
+                try:
+                    output.set_chapters([
+                        {"id": n, "start": int(round(a * 1000)), "end": int(round(b * 1000)),
+                         "time_base": Fraction(1, 1000), "metadata": {"title": name}}
+                        for n, (a, b, name) in enumerate(chapters, 1)])
+                except (av.FFmpegError, ValueError, TypeError, AttributeError):
+                    pass  # a kind of file without chapters
             matroska = output.format.name == "matroska"
             mapping = {}
             files = [s for s in streams if _kind(s) in ("cover", "attachment")]
@@ -526,7 +591,7 @@ def _write(info, spans, chosen, tmp, title, length, progress, cancel, extra, exa
                     redo = Reencoder(info, main, mapping[main.index], output, note)
             try:
                 _copy_packets(source, streams, mapping, output, spans, length, progress,
-                              cancel, redo)
+                              cancel, redo, info)
             finally:
                 if redo:
                     redo.close()
@@ -563,7 +628,7 @@ def _attached_files(source, streams) -> list[tuple[str, str, bytes]]:
 
 
 def _copy_packets(source, streams, mapping, output, spans, length, progress, cancel,
-                  redo=None):
+                  redo=None, info=None):
     """Copy each stretch (absolute start, absolute end, runs to the file's end) in
     turn, the next one's timestamps carrying on where the last one stopped."""
     kinds = {s.index: _kind(s) for s in source.streams}
@@ -582,6 +647,7 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
             offset = start - written  # take this off a time to place it in the part
             finished: set[int] = set()
             started: set[int] = set()  # video tracks that have reached their first keyframe
+            copied_to = None           # the last main picture copied (absolute)
             # Where the main picture is copied; around that, it's re-encoded
             copy_from, copy_to, tail = abs_start, abs_end, None
             if redo is not None:
@@ -590,7 +656,10 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
                     redo.encode(head[0], head[1], offset, last_dts, cancel)
                 if copy_from is None:
                     finished.add(redo.index)  # all of it re-encoded
-            source.seek(int(max(abs_start - lookback, 0) * av.time_base), backward=True)
+            main = next((st for st in source.streams.video if st.index in mapping
+                         and kinds[st.index] == "video"), None)
+            want = copy_from if (redo is not None and copy_from is not None) else abs_start
+            seek_before(source, main, min(want, abs_start), lookback)
             for packet in source.demux():
                 if cancel is not None and cancel.is_set():
                     raise Cancelled
@@ -647,8 +716,10 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
                             packet.pts = cut_ticks
                         else:
                             continue
-                if redo is not None and index == redo.index and redo.restore:
-                    packet = redo.restored(packet)
+                if redo is not None and index == redo.index:
+                    copied_to = float_t if copied_to is None else max(copied_to, float_t)
+                    if redo.restore:
+                        packet = redo.restored(packet)
                 shift = int(round(offset / tb))
                 if packet.pts is not None:
                     packet.pts -= shift
@@ -665,7 +736,8 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
                         if packet.pts is not None and packet.pts < packet.dts:
                             packet.pts = packet.dts
                     last_dts[index] = packet.dts
-                if kind == "subtitle" and packet.duration and packet.pts is not None                         and not to_end:
+                if kind == "subtitle" and packet.duration and packet.pts is not None \
+                        and not to_end:
                     # A line on screen when the stretch ends stops there
                     stop = int(round((Fraction(abs_end) - offset) / tb))
                     if packet.pts + packet.duration > stop:
@@ -677,6 +749,13 @@ def _copy_packets(source, streams, mapping, output, spans, length, progress, can
                     if done - last_report >= 0.005:
                         last_report = done
                         progress(done)
+            if redo is not None and copy_from is not None and not to_end:
+                # With open GOPs, the pictures shown just before the keyframe where
+                # copying stops are stored after it, so weren't copied: re-encode them
+                after = (copied_to + redo.frame) if copied_to is not None else copy_from
+                until = tail[0] if tail else abs_end
+                if after < until - redo.frame / 2:
+                    tail = (after, tail[1] if tail else abs_end)
             if tail:
                 redo.encode(tail[0], tail[1], offset, last_dts, cancel)
             written += Fraction(abs_end) - start
@@ -714,9 +793,17 @@ def can_reencode(info: Info) -> str:
         main = next((s for s in c.streams.video
                      if not s.disposition & av.stream.Disposition.attached_pic), None)
         name = codec_name(main) if main is not None else ""
+        pix = main.codec_context.pix_fmt if main is not None else None
     name = {"libdav1d": "av1", "libaom-av1": "av1"}.get(name, name)
     if name not in ENCODERS:
         return f"Splicer can't re-encode {name or 'this'} video, so its cuts stay on keyframes."
+    try:
+        formats = [f.name for f in (av.codec.Codec(ENCODERS[name][0], "w").video_formats or [])]
+    except (av.FFmpegError, ValueError):
+        formats = []
+    if pix and formats and pix not in formats:
+        return (f"Splicer can't re-encode this video's picture format ({pix}) without "
+                "changing it, so its cuts stay on keyframes.")
     return ""
 
 
@@ -848,7 +935,7 @@ class Reencoder:
         half = self.frame / 2
         if self.note:
             self.note(f"re-encoding {end - start:.1f} s of picture near a cut")
-        self.source.seek(int(max(start, 0) * av.time_base), backward=True)
+        seek_before(self.source, self.stream, start)
         enc = self._encoder()
         shift = int(round(offset / self.tb))
         try:
@@ -862,6 +949,10 @@ class Reencoder:
                     continue
                 if t >= end - half:
                     break
+                if frame.format.name != enc.pix_fmt:
+                    pts = frame.pts
+                    frame = frame.reformat(format=enc.pix_fmt)
+                    frame.pts = pts
                 frame.pts -= shift
                 frame.pict_type = av.video.frame.PictureType.NONE
                 for packet in enc.encode(frame):
@@ -907,6 +998,45 @@ class Reencoder:
         if packet.duration:
             out.duration = packet.duration
         return out
+
+
+# --- The sound's shape, for the timeline -------------------------------------------------
+
+WAVE_STEP = 0.05  # seconds per bar
+
+
+def waveform(path: Path, index: int, origin: float, duration: float,
+             cancel: threading.Event | None = None) -> list[float] | None:
+    """How loud one sound track is, as its peak (0 to 1) every WAVE_STEP seconds.
+    The sound is brought down to 4 kHz mono first: plenty for its shape, and quick
+    to go through without any number-crunching library. None if stopped."""
+    rate = 4000
+    per = int(rate * WAVE_STEP)
+    peaks = [0.0] * (int(duration / WAVE_STEP) + 2)
+    with _open(path) as c:
+        stream = next((s for s in c.streams.audio if s.index == index), None)
+        if stream is None:
+            return []
+        resampler = av.AudioResampler(format="s16", layout="mono", rate=rate)
+        pending = array("h")
+        slot = None
+        try:
+            for n, frame in enumerate(c.decode(stream)):
+                if n % 200 == 0 and cancel is not None and cancel.is_set():
+                    return None
+                if slot is None and frame.pts is not None:
+                    slot = max(int((float(frame.pts * frame.time_base) - origin) / WAVE_STEP), 0)
+                for out in resampler.resample(frame):
+                    pending.frombytes(bytes(out.planes[0])[:out.samples * 2])
+                while len(pending) >= per and slot is not None:
+                    chunk = pending[:per]
+                    del pending[:per]
+                    if slot < len(peaks):
+                        peaks[slot] = max(max(chunk), -min(chunk)) / 32768
+                    slot += 1
+        except av.FFmpegError:
+            pass
+    return peaks
 
 
 # --- Sound only --------------------------------------------------------------------

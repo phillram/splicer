@@ -31,6 +31,7 @@ from pathlib import Path
 
 import av
 
+from splicer.engine import seek_before
 from splicer.subtitles import Cue, active
 
 RATE = 48_000                  # what all sound is turned into: 48 kHz, 16-bit stereo
@@ -733,7 +734,7 @@ class Player:
             self.position = t
             self._report(force=True)
             return
-        self.container.seek(int(max(t + self.origin, 0) * av.time_base), backward=True)
+        seek_before(self.container, self.video, t + self.origin)
         self.frames_iter = self._frames()
         target, last = None, None
         while True:
