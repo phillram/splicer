@@ -32,7 +32,7 @@ from pathlib import Path
 import av
 
 from splicer.engine import seek_before
-from splicer.subtitles import Cue, active
+from splicer.subtitles import Cue, active, longest
 
 RATE = 48_000                  # what all sound is turned into: 48 kHz, 16-bit stereo
 BYTES_PER_SAMPLE = 4
@@ -622,6 +622,7 @@ class Player:
         elif kind == "subtitles":
             self.cues = command[1]
             self.cue_starts = [c.start for c in self.cues]
+            self.cue_longest = longest(self.cues)
             if not self.playing:
                 self._redraw()
         elif self.path is None:
@@ -770,7 +771,7 @@ class Player:
         self.position = t
 
     def _text(self, t: float) -> str:
-        return active(self.cues, self.cue_starts, t) if self.cues else ""
+        return active(self.cues, self.cue_starts, t, self.cue_longest) if self.cues else ""
 
     def _redraw(self):
         if self.last_frame is not None:
@@ -842,7 +843,8 @@ class Player:
         if self.mode != "continue" and start is not None and end is not None and \
                 not (start - EPS <= self.position < end - self.frame_duration * 1.5):
             self._seek(start, exact=True)
-        elif self.position >= self.duration - self.frame_duration:
+        elif self.position >= self.duration - self.frame_duration or                 (self.video and self.eof and not self.frames_ready):
+            # At the end of the video (its last frame can come before the sound ends)
             self._seek(start or 0.0, exact=True)
         if self.session:
             # Carry on from a pause: everything is still where it was
@@ -926,6 +928,12 @@ class Player:
             finished = now >= self.duration - EPS or \
                 (self.sound_clock and self.sound.eof and self.sound.clock()[1])
         if finished:
+            if self.mode == "loop" and start is not None and end is not None:
+                # A part that runs to the end of the video loops too
+                self._end_session()
+                self._seek(start, exact=True)
+                self._play()
+                return
             self._halt()
             self._report(force=True)
             return

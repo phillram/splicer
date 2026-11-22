@@ -253,7 +253,9 @@ def probe(path: Path, progress: Callable[[float], None] | None = None,
         else:
             duration = max((float(s.duration * s.time_base) for s in container.streams
                             if s.duration), default=0.0)
-        tracks = [_track(s) for s in container.streams]
+        # Data tracks (MP4 chapter text, timecodes) aren't offered: they can't be copied
+        # into a part, and the chapters come through anyway
+        tracks = [_track(s) for s in container.streams if _kind(s) != "data"]
         choose_defaults(tracks)
         chapters = _chapters(container, origin, duration)
         info = Info(path, duration, origin, tracks, chapters,
@@ -421,7 +423,7 @@ def safe_name(name: str) -> str:
     name = _BAD.sub(lambda m: {":": " -", '"': "'", "/": "-", "\\": "-", "|": "-"}
                     .get(m.group(), ""), name)
     name = re.sub(r"\s+", " ", name).strip().rstrip(". ")
-    if re.fullmatch(r"(?i)(con|prn|aux|nul|com\d|lpt\d)(\..*)?", name):
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|conin\$|conout\$|(com|lpt)[\d¹²³])(\..*)?", name):
         name = "_" + name
     return name[:180] or "Part"
 

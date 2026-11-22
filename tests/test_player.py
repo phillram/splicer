@@ -93,3 +93,29 @@ def test_keeps_playing_past_the_end(player):
     p.play()
     wait(p, events, lambda e: e[0] == "pos" and e[1] > 12.3, timeout=5)
     p.pause()
+
+
+def test_a_part_at_the_end_of_the_video_loops(player):
+    # Its last frame comes before the sound ends, so the picture runs out first
+    p, events = player
+    p.set_range(20.0, p.duration)
+    p.set_end_mode("loop")
+    p.seek(p.duration - 1.0)
+    p.play()
+    wait(p, events, lambda e: e[0] == "pos" and e[1] < 21.0, timeout=5)
+    assert p.playing
+    p.pause()
+
+
+def test_play_again_after_stopping_at_the_end_of_the_video(player):
+    p, events = player
+    p.set_range(20.0, p.duration)
+    p.set_end_mode("stop")
+    p.seek(p.duration - 0.5)
+    p.play()
+    wait(p, events, lambda e: e == ("state", True))
+    wait(p, events, lambda e: e == ("state", False), timeout=5)
+    settle(p, events)
+    p.play()
+    wait(p, events, lambda e: e[0] == "pos" and e[1] < 21.0, timeout=5)
+    p.pause()

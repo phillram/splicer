@@ -166,8 +166,7 @@ def test_subtitle_on_screen_at_the_cut_carries_over(mkv, tmp_path):
 
 def test_mp4(tmp_path):
     info = engine.probe(MP4)
-    assert [t.kind for t in info.tracks] == ["video", "audio", "audio", "subtitle", "data"]
-    assert not info.tracks[4].chosen        # the chapter-title track
+    assert [t.kind for t in info.tracks] == ["video", "audio", "audio", "subtitle"]
     assert len(info.chapters) == 3
     s, e = engine.snap(info, 10), engine.snap(info, 20)
     tracks = [0, 1, 3]
@@ -213,6 +212,10 @@ def test_no_tracks(mkv, tmp_path):
     ('A: "B"/C\\D|E?*<>', "A - 'B'-C-D-E"),
     ("trailing dots...", "trailing dots"),
     ("CON", "_CON"),
+    ("CONIN$", "_CONIN$"),
+    ("conout$.txt", "_conout$.txt"),
+    ("COM¹", "_COM¹"),
+    ("Console", "Console"),
     ("", "Part"),
 ])
 def test_safe_name(name, safe):
@@ -422,3 +425,19 @@ def test_mpeg2_can_be_reencoded(tmp_path):
     s, e = engine.snap_frame(info, 1.1), engine.snap_frame(info, 6.4)
     path = engine.cut(info, s, e, [0], tmp_path / "part.ts", exact=True)
     assert len(decoded_times(path)) == round((e - s) * 30)
+
+
+def test_sound_only_with_cover_art(tmp_path):
+    # Cover art is checked by default, but .m4a can't carry it: the sound still saves
+    info = engine.probe(COVER)
+    sound = next(t for t in info.tracks if t.kind == "audio")
+    assert engine.sound_ext(sound) == ".m4a"
+    dest = tmp_path / "x.m4a"
+    engine.cut(info, 0, 2, [sound.index], dest)
+    assert dest.stat().st_size > 0
+
+
+def test_data_tracks_are_not_offered():
+    info = engine.probe(FIXTURES / "chaptered.mp4")
+    assert "data" not in [t.kind for t in info.tracks]
+    assert len(info.chapters) == 3

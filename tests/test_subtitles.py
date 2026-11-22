@@ -28,3 +28,9 @@ def test_tidy_and_active():
     assert active(cues, starts, 2.5) == "first\noverlap"
     assert active(cues, starts, 4.5) == ""
     assert active(cues, starts, 8.9) == "no end"
+
+
+def test_a_long_line_under_many_short_ones():
+    cues = tidy([Cue(0.0, 100.0, "sign")] + [Cue(i, i + 0.5, f"line{i}") for i in range(1, 21)])
+    starts = [c.start for c in cues]
+    assert active(cues, starts, 18.2) == "sign\nline18"
