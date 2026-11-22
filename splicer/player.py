@@ -585,8 +585,6 @@ class Player:
                     self.moves_done = command[-1]
                     continue
                 try:
-                    if command[0] in MOVES:
-                        self.moves_done = command[-1]
                     if self._command(command) is False:
                         self._close_file()
                         self.sound.close()
@@ -594,6 +592,12 @@ class Player:
                 except Exception as e:  # an odd file shouldn't take the player down
                     self._halt()
                     self.notify(("error", str(e) or repr(e)))
+                if command[0] in MOVES:
+                    # Done only now it's there: on the way (pausing first, say) the
+                    # position reported is still the old one, and the window would
+                    # jump back to it
+                    self.moves_done = command[-1]
+                    self._report(force=True)
             if self.playing:
                 try:
                     self._tick()
@@ -965,6 +969,6 @@ class Player:
 
     def _report(self, force: bool = False):
         now = time.perf_counter()
-        if force or now - self.last_report > 0.04:
+        if force or now - self.last_report > 0.012:  # every frame: a smooth bar
             self.last_report = now
             self.notify(("pos", self.position, self.moves_done))
