@@ -234,3 +234,23 @@ def test_sound_only_from_a_video_with_cover_art(window, tmp_path):
     files = list((tmp_path / "out").iterdir())
     assert len(files) == 1 and files[0].suffix == ".m4a"
     assert not a.shown_messages
+
+
+def test_quick_clicks_end_where_the_last_one_points(window):
+    # Frame back a bunch, faster than the player can find frames, then back 5 s
+    a = window
+    a.seek(10.0)
+    pump(a, 0.3)
+    for _ in range(8):
+        a.step(-1)
+    a.step(1)
+    a.jump(-5)
+    expected = 10.0 - 7 / 30 - 5
+    assert a.position == pytest.approx(expected, abs=0.02)  # straight away
+    wait(a, lambda: a.player.moves_done == a.player.moves_sent)
+    pump(a, 0.3)
+    assert a.position == pytest.approx(expected, abs=0.02)
+    assert a.player.position == pytest.approx(expected, abs=0.02)
+    a.step(1)
+    pump(a, 0.3)
+    assert a.player.position == pytest.approx(expected + 1 / 30, abs=0.02)

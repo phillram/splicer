@@ -4,6 +4,7 @@ losslessly."""
 
 from __future__ import annotations
 
+import bisect
 import ctypes
 import json
 import os
@@ -1622,7 +1623,7 @@ class App(BaseTk):
         part.removed.append([at, end])
         self.shown_part = part
         self._changed(select=part)
-        self.player.seek(max(at - 2.0, part.start), pause=True)
+        self.seek(max(at - 2.0, part.start), pause=True)
         self.status.configure(
             text=f"Left out {fmt_time(at)} to {fmt_time(end)} ({end - at:.2f} s). Change its "
                  "times below or drag its edges on the timeline; play across it to see the "
@@ -1660,9 +1661,9 @@ class App(BaseTk):
         self._changed(select=part)
         # Show the join: the last picture before the stretch, or the first after it
         if edge == 0:
-            self.player.seek(stretch[0] - self.player.frame_duration, pause=True)
+            self.seek(stretch[0] - self.player.frame_duration, pause=True)
         else:
-            self.player.seek(stretch[1], pause=True)
+            self.seek(stretch[1], pause=True)
 
     def put_back(self, part: Part, i: int):
         if part in self.parts and i < len(part.removed) and not self.busy:
@@ -1889,7 +1890,7 @@ class App(BaseTk):
         self.player.set_range(part.start, part.end, [tuple(r) for r in part.removed])
         if part is not self.shown_part:
             self.shown_part = part
-            self.player.seek(part.start)  # carries on playing if it was
+            self.seek(part.start)  # carries on playing if it was
             self.timeline.follow(part.start)
         self._draw_timelines()
         self._update_time()
@@ -1982,9 +1983,9 @@ class App(BaseTk):
         self._changed(select=part)
         # Show the cut: the part's first frame, or its last
         if side == "start":
-            self.player.seek(t, pause=True)
+            self.seek(t, pause=True)
         else:
-            self.player.seek(t - self.player.frame_duration, pause=True)
+            self.seek(t - self.player.frame_duration, pause=True)
         notes = []
         if asked is not None and abs(asked - t) > EPS and not self.anywhere:
             notes.append(f"{fmt_time(asked)} isn't a keyframe: the cut is at the nearest one, "
@@ -2012,15 +2013,32 @@ class App(BaseTk):
         if self.info:
             self.player.toggle()
 
+    # Every button works from where the last one was going, not from where the player
+    # has got to: it may still be finding an older frame, and the newest click wins.
+
+    def _landing(self, t: float) -> float:
+        """The frame the player shows when asked for t: the first from half a frame
+        before it."""
+        t = max(0.0, min(t, self.info.duration))
+        frames = self.info.frames
+        if not frames:
+            return t
+        i = bisect.bisect_left(frames, t - self.player.frame_duration / 2)
+        return frames[i] if i < len(frames) else frames[-1]
+
     def stop(self):
         if self.info:
+            part = self._current()
+            self.position = self._landing(part.start if part else 0.0)
             self.player.stop()
+            self._update_time()
 
-    def seek(self, t: float, exact: bool = True):
+    def seek(self, t: float, exact: bool = True, pause: bool = False):
         if not self.info:
             return
-        self.position = max(0.0, min(t, self.info.duration))
-        self.player.seek(self.position, exact=exact)
+        t = max(0.0, min(t, self.info.duration))
+        self.position = self._landing(t) if exact else t
+        self.player.seek(t, exact=exact, pause=pause)
         self._update_time()
 
     def jump(self, seconds: float):
@@ -2032,17 +2050,23 @@ class App(BaseTk):
                       else engine.previous_keyframe(self.info, self.position))
 
     def step(self, frames: int):
-        if self.info:
-            self.player.step(frames)
+        """Frames forward (or back), paused."""
+        if not self.info:
+            return
+        t = self.position
+        for _ in range(abs(frames)):
+            t = engine.next_frame(self.info, t) if frames > 0 \
+                else engine.previous_frame(self.info, t)
+        if self.info.frames:
+            t = min(t, self.info.frames[-1])  # the end of the video has no frame of its own
+        self.seek(t, pause=True)
 
     def go_part_edge(self, side: str):
         part = self._current()
         if not part:
             return
-        if side == "start":
-            self.player.seek(part.start, pause=True)
-        else:
-            self.player.seek(part.end - self.player.frame_duration, pause=True)
+        self.seek(part.start if side == "start" else part.end - self.player.frame_duration,
+                  pause=True)
 
     def zoom_to_part(self):
         part = self._current()
@@ -2355,6 +2379,8 @@ class App(BaseTk):
         """One message from a worker thread or the player."""
         kind = event[0]
         if kind == "pos":
+            if event[2] < self.player.moves_sent:
+                return  # from a move overtaken by a newer click: not where it's going
             self.position = event[1]
             self._update_time()
         elif kind == "state":
