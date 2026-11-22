@@ -263,7 +263,7 @@ class FullScreen(tk.Toplevel):
         super().__init__(app, bg="black")
         self.app = app
         self.attributes("-fullscreen", True)
-        self.video = tk.Frame(self, bg="black")
+        self.video = tk.Frame(self, bg="")  # the player paints it all: no flashing
         self.video.pack(fill="both", expand=True)
         self.bar = ttk.Frame(self, style="Bar.TFrame", padding=(12, 6))
         self.play_btn = ttk.Button(self.bar, text="▶", style="Transport.TButton",
@@ -523,6 +523,10 @@ class App(BaseTk):
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         self.option_add("*TCombobox*Listbox.selectForeground", "white")
+        # Buttons, checkboxes and sliders don't keep the keyboard after a click: with
+        # it, Space pressed the last button clicked instead of playing or pausing
+        for kind in ("TButton", "TCheckbutton", "TMenubutton", "TScale"):
+            self.option_add(f"*{kind}.takeFocus", 0)
         self.option_add("*Menu.background", PANEL)
         self.option_add("*Menu.foreground", FG)
         self.option_add("*Menu.activeBackground", ACCENT)
@@ -965,13 +969,29 @@ class App(BaseTk):
         }
         for key, action in keys.items():
             self.bind_all(key, lambda e, a=action: self._key(e, a))
+        self.bind_all("<ButtonPress-1>", self._clicked, add=True)
         # The parts list has its own meaning for these; the player's comes first
         for key in ("<space>", "<Left>", "<Right>", "<Control-Left>", "<Control-Right>",
                     "<Home>", "<End>", "<Prior>", "<Next>"):
             self.tree.bind(key, lambda e, k=key: self._key(e, keys[k]))
 
     def _typing(self, widget) -> bool:
-        return isinstance(widget, (ttk.Entry, tk.Entry, ttk.Combobox, tk.Text))
+        if isinstance(widget, ttk.Combobox):  # a pick-from-list box takes no typing
+            return "readonly" not in widget.state()
+        return isinstance(widget, (ttk.Entry, tk.Entry, tk.Text))
+
+    def _clicked(self, event):
+        """A click anywhere but a box to type in, or the parts list, leaves the box
+        being typed in, so the keys work the player again."""
+        widget = event.widget
+        if not isinstance(widget, tk.Misc) or \
+                isinstance(widget, (ttk.Entry, tk.Entry, tk.Text, ttk.Treeview, tk.Listbox)):
+            return
+        try:
+            if self._typing(self.focus_get()):
+                widget.winfo_toplevel().focus_set()
+        except (KeyError, tk.TclError):  # focus in a menu or a closed window
+            pass
 
     def _key(self, event, action):
         if self._typing(event.widget) and event.keysym != "Escape":
@@ -1049,6 +1069,7 @@ class App(BaseTk):
         self.title(f"Splicer: {path.name}")
         self.placeholder.configure(text="Reading…")
         self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        self.video.configure(bg="black")
         self._refresh_all()
         load_id = self.load_id
 
@@ -1084,6 +1105,9 @@ class App(BaseTk):
         self.output_var.set(str(info.path.parent / engine.safe_name(info.path.stem)))
         if info.has_video:
             self.placeholder.place_forget()
+            # The player paints all of it: Tk painting it black too, as the window
+            # changes size, made the picture flash
+            self.video.configure(bg="")
         else:
             self.placeholder.configure(text="No picture: sound only.")
         self._remember_recent(info.path)

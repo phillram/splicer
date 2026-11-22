@@ -380,8 +380,12 @@ class Screen:
             return
         try:
             if force_clear or rect != self.last_rect:
-                full = wintypes.RECT(0, 0, cw, ch)
-                self.user32.FillRect(dc, ctypes.byref(full), self.black)
+                # Black bars around the picture only: blacking out the picture too,
+                # then drawing it, flashed while the window changed size
+                for bar in ((0, 0, cw, dy), (0, dy + dh, cw, ch),
+                            (0, dy, dx, dy + dh), (dx + dw, dy, cw, dy + dh)):
+                    if bar[2] > bar[0] and bar[3] > bar[1]:
+                        self.user32.FillRect(dc, ctypes.byref(wintypes.RECT(*bar)), self.black)
                 self.last_rect = rect
             header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 24, 0,
                                       0, 0, 0, 0, 0)

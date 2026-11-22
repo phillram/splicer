@@ -254,3 +254,34 @@ def test_quick_clicks_end_where_the_last_one_points(window):
     a.step(1)
     pump(a, 0.3)
     assert a.player.position == pytest.approx(expected + 1 / 30, abs=0.02)
+
+
+def test_buttons_leave_the_keyboard_to_the_player(window):
+    # A clicked button kept the keyboard, so Space pressed it again instead of playing
+    a = window
+    for w in (a.play_btn, a.full_btn, a.frame_btn, a.numbered_check, a.splice_btn):
+        assert str(w.cget("takefocus")) == "0"
+    # Space plays from a pick-from-list box, but not from a box being typed in
+    assert not a._typing(a.subtitle_box)
+    assert a._typing(a.title_entry)
+
+
+def test_a_click_leaves_the_box_being_typed_in(window, monkeypatch):
+    a = window
+    moved = []
+    monkeypatch.setattr(a, "focus_get", lambda: a.title_entry)
+    monkeypatch.setattr(a, "focus_set", lambda: moved.append(True))
+
+    class Click:
+        widget = a.play_btn
+    a._clicked(Click)
+    assert moved
+    moved.clear()
+    Click.widget = a.time_entries["start"] if hasattr(a, "time_entries") else a.output_entry
+    a._clicked(Click)  # clicking another box to type in keeps typing
+    assert not moved
+
+
+def test_the_picture_is_left_to_the_player(window):
+    # Tk painting the video black as the window changed size made it flash
+    assert window.video.cget("bg") == ""
