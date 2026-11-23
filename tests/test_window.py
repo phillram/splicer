@@ -141,6 +141,9 @@ def test_left_out_stretches_are_locked_while_splicing(window):
     a.seek(15.0)
     pump(a, 0.2)
     a.cut_out()
+    a.seek(18.0)
+    pump(a, 0.2)
+    a.cut_out()
     part = a._current()
     assert part.removed
     a.busy = "splicing"
@@ -234,3 +237,138 @@ def test_sound_only_from_a_video_with_cover_art(window, tmp_path):
     files = list((tmp_path / "out").iterdir())
     assert len(files) == 1 and files[0].suffix == ".m4a"
     assert not a.shown_messages
+
+
+def test_quick_clicks_end_where_the_last_one_points(window):
+    # Frame back a bunch, faster than the player can find frames, then back 5 s
+    a = window
+    a.seek(10.0)
+    pump(a, 0.3)
+    for _ in range(8):
+        a.step(-1)
+    a.step(1)
+    a.jump(-5)
+    expected = 10.0 - 7 / 30 - 5
+    assert a.position == pytest.approx(expected, abs=0.02)  # straight away
+    wait(a, lambda: a.player.moves_done == a.player.moves_sent)
+    pump(a, 0.3)
+    assert a.position == pytest.approx(expected, abs=0.02)
+    assert a.player.position == pytest.approx(expected, abs=0.02)
+    a.step(1)
+    pump(a, 0.3)
+    assert a.player.position == pytest.approx(expected + 1 / 30, abs=0.02)
+
+
+def test_buttons_leave_the_keyboard_to_the_player(window):
+    # A clicked button kept the keyboard, so Space pressed it again instead of playing
+    a = window
+    for w in (a.play_btn, a.full_btn, a.frame_btn, a.numbered_check, a.splice_btn):
+        assert str(w.cget("takefocus")) == "0"
+    # Space plays from a pick-from-list box, but not from a box being typed in
+    assert not a._typing(a.subtitle_box)
+    assert a._typing(a.title_entry)
+
+
+def test_a_click_leaves_the_box_being_typed_in(window, monkeypatch):
+    a = window
+    moved = []
+    monkeypatch.setattr(a, "focus_get", lambda: a.title_entry)
+    monkeypatch.setattr(a, "focus_set", lambda: moved.append(True))
+
+    class Click:
+        widget = a.play_btn
+    a._clicked(Click)
+    assert moved
+    moved.clear()
+    Click.widget = a.time_entries["start"] if hasattr(a, "time_entries") else a.output_entry
+    a._clicked(Click)  # clicking another box to type in keeps typing
+    assert not moved
+
+
+def test_the_picture_is_left_to_the_player(window):
+    # Tk painting the video black as the window changed size made it flash
+    assert window.video.cget("bg") == ""
+
+
+def test_shortcuts_window(window):
+    a = window
+    a.show_shortcuts()
+    win = a.shortcuts_window
+    win.attributes("-alpha", 0.0)
+    a.show_shortcuts()  # a second click brings back the same one
+    assert a.shortcuts_window is win
+    win.destroy()
+
+
+def test_clicking_the_empty_player_opens_a_video(window, monkeypatch):
+    a = window
+    opened, toggled = [], []
+    monkeypatch.setattr(a, "_choose_file", lambda: opened.append(True))
+    monkeypatch.setattr(a, "toggle_play", lambda: toggled.append(True))
+    a._video_clicked()
+    assert toggled and not opened  # a video is open: play or pause
+    a.info = None
+    a._video_clicked()
+    assert opened
+
+
+def test_cutting_out_marks_the_start_then_the_end(window):
+    a = window
+    a._select(a.parts[1])
+    part = a._current()
+    a.seek(15.0, pause=True)
+    pump(a, 0.2)
+    a.cut_out()
+    assert part.removed == []  # only marked: nothing skipped, no jump
+    assert a.position == 15.0
+    assert a.cut_btn.cget("text") == "End the cut here"
+    a.seek(18.0, pause=True)
+    pump(a, 0.2)
+    a.cut_out()
+    assert part.removed == [[15.0, 18.0]]
+    assert a.cut_btn.cget("text") == "Cut out a section"
+    assert a.position == 18.0
+
+
+def test_a_marked_cut_can_be_cancelled(window):
+    a = window
+    a._select(a.parts[1])
+    a.seek(15.0, pause=True)
+    pump(a, 0.2)
+    a.cut_out()
+    a.cancel_cut()
+    assert a.cut_from is None and a._current().removed == []
+    assert a.cut_btn.cget("text") == "Cut out a section"
+
+
+def test_now_past_the_end_moves_the_whole_stretch(window):
+    a = window
+    a._select(a.parts[1])
+    part = a._current()
+    part.removed = [[12.0, 13.5]]  # keyframes are every 1.5 s
+    a._show_selected()
+    a.seek(16.5, pause=True)
+    pump(a, 0.2)
+    a.move_removed(part, 0, 0, a.snap(a.position), asked=a.position, carry=True)
+    assert part.removed == [[16.5, 18.0]]
+    a.seek(15.0, pause=True)
+    pump(a, 0.2)
+    a.move_removed(part, 0, 1, a.snap(a.position), asked=a.position, carry=True)
+    assert part.removed == [[13.5, 15.0]]
+
+
+def test_moving_a_cut_leaves_the_next_part_alone_by_default(window):
+    a = window
+    first, second = a.parts[0], a.parts[1]
+    assert abs(first.end - second.start) < 1e-6  # they share a cut
+    start = second.start
+    a.move_cut(first, "end", a.step_point(first.end, -1))
+    assert first.end < start and second.start == start
+
+
+def test_moving_a_cut_can_move_the_next_part_too(window):
+    a = window
+    a.joined_var.set(True)
+    first, second = a.parts[0], a.parts[1]
+    a.move_cut(first, "end", a.step_point(first.end, -1))
+    assert second.start == first.end

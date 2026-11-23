@@ -40,6 +40,10 @@ timeline. **Add part**, **Split** and **Remove** do what they say. Uncheck a
 part to skip it; Shift+click a checkbox to check or uncheck every part up to
 the last one you clicked. Everything can be undone with `Ctrl+Z`.
 
+Changing a part changes only that part. If a chapter boundary is wrong and
+you'd like the part next to it to follow, check **Moving a cut moves the part
+next to it**: then moving a cut that two parts share moves both.
+
 The timeline along the bottom shows the sound's waveform, which makes the gaps
 between songs or scenes easy to spot. `Ctrl+wheel` zooms in.
 
@@ -48,9 +52,14 @@ later.
 
 ### Cutting a bit out, or joining parts
 
-Select a part, find the bit you don't want, and hit **Cut out a section**.
-Adjust its times; the timeline shows it as a dark "left out" block. The part
-is saved as one file with that bit removed.
+Select a part, play to where the bit you don't want starts, and hit **Cut out
+a section**. Nothing changes yet: play on to where it ends and hit **End the
+cut here** (or **Cancel**). The timeline shows it as a dark "left out" block,
+and the part is saved as one file with that bit removed.
+
+Adjust its times by typing, with **Now**, or by dragging its edges on the
+timeline. Taking its start past its end (or its end before its start) moves
+the whole stretch along, keeping its length.
 
 To join parts into one file, Ctrl+click them in the list and hit **Join**.
 

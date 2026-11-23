@@ -4,6 +4,7 @@ losslessly."""
 
 from __future__ import annotations
 
+import bisect
 import ctypes
 import json
 import os
@@ -52,22 +53,24 @@ PART_COLUMNS = (  # id, heading, width, anchor, stretch
     ("length", "Length", 80, "e", False),
 )
 
-SHORTCUTS = """Space  play / pause
-←  →  back / forward 5 seconds
-,  .  one frame back / forward
-Ctrl+←  Ctrl+→  keyframe before / after
-Home  End  start / last frame of the part
-Page Up  Page Down  previous / next part
-I  O  start / end the part at the current time
-Ctrl+Z  Ctrl+Y  undo / redo
-+  −  zoom the timeline in / out
-S  save the frame as a picture
-F  full screen (Esc to leave)
-M  mute
-
-On the timeline: drag a cut to move it, click to jump there,
-wheel to scroll, Ctrl+wheel to zoom.
-Shift+click a checkbox to check or uncheck all the parts up to it."""
+SHORTCUTS = (  # keys, what they do; then what the mouse does
+    ("Space", "Play / pause"),
+    ("← →", "Back / forward 5 seconds"),
+    (", .", "One frame back / forward"),
+    ("Ctrl+← Ctrl+→", "Keyframe before / after"),
+    ("Home End", "Start / last frame of the part"),
+    ("Page Up Page Down", "Previous / next part"),
+    ("I O", "Start / end the part at the current time"),
+    ("Ctrl+Z Ctrl+Y", "Undo / redo"),
+    ("Ctrl+A", "Select every part"),
+    ("+ −", "Zoom the timeline in / out"),
+    ("S", "Save the frame as a picture"),
+    ("F", "Full screen (Esc leaves)"),
+    ("M", "Mute"),
+)
+MOUSE = ("On the timeline, drag a cut to move it and click to jump there. The wheel "
+         "scrolls; Ctrl+wheel zooms. Shift+click a part's checkbox to check or uncheck "
+         "every part up to the last one you clicked.")
 
 
 @dataclass(eq=False)
@@ -262,7 +265,7 @@ class FullScreen(tk.Toplevel):
         super().__init__(app, bg="black")
         self.app = app
         self.attributes("-fullscreen", True)
-        self.video = tk.Frame(self, bg="black")
+        self.video = tk.Frame(self, bg="")  # the player paints it all: no flashing
         self.video.pack(fill="both", expand=True)
         self.bar = ttk.Frame(self, style="Bar.TFrame", padding=(12, 6))
         self.play_btn = ttk.Button(self.bar, text="▶", style="Transport.TButton",
@@ -431,7 +434,7 @@ class App(BaseTk):
 
     # --- Settings ---
 
-    SETTING_TYPES = {"geometry": str, "numbered": bool, "joined": bool, "volume": (int, float),
+    SETTING_TYPES = {"geometry": str, "numbered": bool, "move_neighbor": bool, "volume": (int, float),
                      "end_mode": str, "save_as": str, "cut_mode": str, "last_dir": str,
                      "recent": list, "panes": list}
 
@@ -449,7 +452,8 @@ class App(BaseTk):
     def _save(self):
         self.settings["geometry"] = self.geometry()
         self.settings["numbered"] = bool(self.numbered_var.get())
-        self.settings["joined"] = bool(self.joined_var.get())
+        self.settings["move_neighbor"] = bool(self.joined_var.get())
+        self.settings.pop("joined", None)  # was on by default; editing one part moved another
         self.settings["volume"] = int(self.volume_var.get())
         self.settings["end_mode"] = self.end_mode
         self.settings["save_as"] = self.save_as
@@ -522,6 +526,10 @@ class App(BaseTk):
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
         self.option_add("*TCombobox*Listbox.selectForeground", "white")
+        # Buttons, checkboxes and sliders don't keep the keyboard after a click: with
+        # it, Space pressed the last button clicked instead of playing or pausing
+        for kind in ("TButton", "TCheckbutton", "TMenubutton", "TScale"):
+            self.option_add(f"*{kind}.takeFocus", 0)
         self.option_add("*Menu.background", PANEL)
         self.option_add("*Menu.foreground", FG)
         self.option_add("*Menu.activeBackground", ACCENT)
@@ -571,9 +579,6 @@ class App(BaseTk):
         status.pack(side="bottom", fill="x")
         self.status = ttk.Label(status, text=f"Splicer {__version__}", style="Bar.TLabel")
         self.status.pack(side="left", fill="x", expand=True)
-        keys = ttk.Label(status, text="Shortcuts", style="Bar.TLabel", cursor="hand2")
-        keys.pack(side="right")
-        tip(keys, SHORTCUTS)
 
         # Parts and Tracks | Player, over the timeline: drag the gaps to resize
         self.outer = ttk.Panedwindow(self, orient="vertical")
@@ -614,6 +619,8 @@ class App(BaseTk):
         recent = ttk.Menubutton(row, text="Recent", menu=self.recent_menu)
         recent.pack(side="left", padx=(6, 0))
         tip(recent, "Videos you opened lately.")
+        tip(ttk.Button(row, text="Keyboard shortcuts", command=self.show_shortcuts),
+            "The keys, and what the mouse does on the timeline.").pack(side="right")
         names = ttk.Frame(row, style="Bar.TFrame")
         names.pack(side="left", fill="x", expand=True, padx=(12, 0))
         self.file_label = ttk.Label(names, text="No video open", style="BarStrong.TLabel")
@@ -714,7 +721,7 @@ class App(BaseTk):
         self.more_menu.add_separator()
         self.more_menu.add_command(label="Start again from the chapters",
                                    command=self._reset_parts)
-        more = ttk.Menubutton(head, text="More", menu=self.more_menu)
+        more = ttk.Menubutton(head, text="More", menu=self.more_menu, width=5)
         more.pack(side="right", padx=(4, 0))
         self.part_buttons.append(more)
         self.redo_btn = tip(ttk.Button(head, text="Redo",
@@ -817,18 +824,25 @@ class App(BaseTk):
         cut_row.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.cut_btn = tip(ttk.Button(cut_row, text="Cut out a section", command=self.cut_out),
                            "Leave a stretch out of the middle of this part; what's either "
-                           "side of it is joined into one file, still losslessly. It starts "
-                           "at the current time: change its times below, or drag its edges "
-                           "on the timeline.")
+                           "side of it is joined into one file, still losslessly. Press it "
+                           "where the stretch starts, play on, and press it again where it "
+                           "ends. Change its times below, or drag its edges on the timeline.")
         self.cut_btn.pack(side="left")
+        self.cut_note = ttk.Label(cut_row, text="", style="TabNote.TLabel")
+        self.cut_note.pack(side="left", padx=(8, 0))
+        self.cut_cancel_btn = tip(ttk.Button(cut_row, text="Cancel", command=self.cancel_cut),
+                                  "Forget the start that's marked; nothing is left out.")
         self.edit_widgets.append(self.cut_btn)
+        self.cut_from: tuple | None = None  # (part, time) while a cut's start is marked
         self.removed_box = ttk.Frame(edit, style="Tab.TFrame")
         self.removed_box.grid(row=5, column=0, columnspan=2, sticky="ew")
-        self.joined_var = tk.BooleanVar(value=self.settings.get("joined", True))
+        # Off by default: editing one part leaves every other part alone
+        self.joined_var = tk.BooleanVar(value=self.settings.get("move_neighbor", False))
         tip(ttk.Checkbutton(edit, text="Moving a cut moves the part next to it", variable=self.joined_var,
                             style="Tab.TCheckbutton"),
             "When a part ends where the next one starts, moving that cut moves both, so "
-            "nothing falls between them.").grid(row=6, column=0, columnspan=2, sticky="w",
+            "nothing falls between them. Unchecked, only the part you're editing "
+            "changes.").grid(row=6, column=0, columnspan=2, sticky="w",
                                                 pady=(8, 0))
 
     def _build_player(self, box):
@@ -844,13 +858,15 @@ class App(BaseTk):
         self.overview.pack(side="bottom", fill="x", pady=(6, 0))
         self.video = tk.Frame(box, bg="black", cursor="hand2")
         self.video.pack(fill="both", expand=True, pady=(4, 0))
-        self.placeholder = tk.Label(self.video, text="Open a video to watch it here.",
-                                    bg="black", fg=MUTED, font=("Segoe UI", 10))
+        self.placeholder = tk.Label(self.video, text="Click here to open a video, or drop one "
+                                    "on the window.", bg="black", fg=MUTED,
+                                    font=("Segoe UI", 10), cursor="hand2")
         self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        self.placeholder.bind("<ButtonRelease-1>", lambda e: self._video_clicked())
         self.video.bind("<Configure>", lambda e: self.redraw_soon())
         self.video.bind("<Expose>", lambda e: self.redraw_soon())
-        self.video.bind("<ButtonRelease-1>", lambda e: self.toggle_play())
-        self.video.bind("<Double-1>", lambda e: self.enter_full_screen())
+        self.video.bind("<ButtonRelease-1>", lambda e: self._video_clicked())
+        self.video.bind("<Double-1>", lambda e: self.info and self.enter_full_screen())
 
         row = ttk.Frame(controls)
         row.pack(fill="x")
@@ -964,13 +980,29 @@ class App(BaseTk):
         }
         for key, action in keys.items():
             self.bind_all(key, lambda e, a=action: self._key(e, a))
+        self.bind_all("<ButtonPress-1>", self._clicked, add=True)
         # The parts list has its own meaning for these; the player's comes first
         for key in ("<space>", "<Left>", "<Right>", "<Control-Left>", "<Control-Right>",
                     "<Home>", "<End>", "<Prior>", "<Next>"):
             self.tree.bind(key, lambda e, k=key: self._key(e, keys[k]))
 
     def _typing(self, widget) -> bool:
-        return isinstance(widget, (ttk.Entry, tk.Entry, ttk.Combobox, tk.Text))
+        if isinstance(widget, ttk.Combobox):  # a pick-from-list box takes no typing
+            return "readonly" not in widget.state()
+        return isinstance(widget, (ttk.Entry, tk.Entry, tk.Text))
+
+    def _clicked(self, event):
+        """A click anywhere but a box to type in, or the parts list, leaves the box
+        being typed in, so the keys work the player again."""
+        widget = event.widget
+        if not isinstance(widget, tk.Misc) or \
+                isinstance(widget, (ttk.Entry, tk.Entry, tk.Text, ttk.Treeview, tk.Listbox)):
+            return
+        try:
+            if self._typing(self.focus_get()):
+                widget.winfo_toplevel().focus_set()
+        except (KeyError, tk.TclError):  # focus in a menu or a closed window
+            pass
 
     def _key(self, event, action):
         if self._typing(event.widget) and event.keysym != "Escape":
@@ -1048,6 +1080,7 @@ class App(BaseTk):
         self.title(f"Splicer: {path.name}")
         self.placeholder.configure(text="Reading…")
         self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
+        self.video.configure(bg="black")
         self._refresh_all()
         load_id = self.load_id
 
@@ -1083,6 +1116,9 @@ class App(BaseTk):
         self.output_var.set(str(info.path.parent / engine.safe_name(info.path.stem)))
         if info.has_video:
             self.placeholder.place_forget()
+            # The player paints all of it: Tk painting it black too, as the window
+            # changes size, made the picture flash
+            self.video.configure(bg="")
         else:
             self.placeholder.configure(text="No picture: sound only.")
         self._remember_recent(info.path)
@@ -1601,41 +1637,86 @@ class App(BaseTk):
         info, part = self.info, self._current()
         if not info or not part or self.busy:
             return
-        inside = lambda t: part.start + EPS < t < part.end - EPS  # noqa: E731
-        at = self.snap(self.position)
-        if not inside(at):
-            at = self.snap((part.start + part.end) / 2)
-        if not inside(at):
-            at = self.step_point(part.start, 1)
-        if self.anywhere:
-            end = self.snap(min(at + 3.0, part.end - 0.5))
-        else:
-            end = next((k for k in info.keyframes if k >= at + 2.5 - EPS), None)
-            if end is None or not end < part.end - EPS:
-                end = engine.next_keyframe(info, at)
-        if not (inside(at) and inside(end) and end > at + EPS):
-            self.status.configure(text="This part is too short to cut a section out of: "
-                                       "there aren't keyframes enough inside it.")
+        # Two presses: the first marks where the stretch starts and changes nothing else (no
+        # jump, nothing skipped while playing on); the second, where it ends.
+        mark = self.cut_from
+        if mark is None or mark[0] is not part:
+            at = self.snap(self.position)
+            if not part.start - EPS <= at < part.end - EPS:
+                self.status.configure(text="Go to where the stretch to leave out starts, inside "
+                                           "this part, then press Cut out a section.")
+                self.bell()
+                return
+            self.cut_from = (part, self.position)
+            self._show_cut_mark()
+            self.status.configure(
+                text=f"Cutting from {fmt_time(at)}. Play on to where the stretch ends and "
+                     "press End the cut here.")
+            return
+        a = min(max(self.snap(mark[1]), part.start), part.end)
+        b = min(max(self.snap(self.position), part.start), part.end)
+        a, b = min(a, b), max(a, b)
+        if b - a <= EPS:
+            near = "" if self.anywhere else " (or the same keyframe)"
+            self.status.configure(
+                text=f"That's where the cut starts{near}, so nothing would be left out. Play "
+                     "on to where the stretch ends, then press End the cut here.")
             self.bell()
             return
         self._remember()
-        part.removed.append([at, end])
+        self.cut_from = None
+        part.removed.append([a, b])
         self.shown_part = part
         self._changed(select=part)
-        self.player.seek(max(at - 2.0, part.start), pause=True)
         self.status.configure(
-            text=f"Left out {fmt_time(at)} to {fmt_time(end)} ({end - at:.2f} s). Change its "
+            text=f"Left out {fmt_time(a)} to {fmt_time(b)} ({b - a:.2f} s). Change its "
                  "times below or drag its edges on the timeline; play across it to see the "
                  "join.")
 
+    def cancel_cut(self):
+        if self.cut_from is not None:
+            self.cut_from = None
+            self._show_cut_mark()
+            self.status.configure(text="Cancelled: nothing is left out.")
+
+    def _show_cut_mark(self):
+        """The Cut out button says what pressing it does next."""
+        part = self._current() if self.info else None
+        if self.cut_from is not None and self.cut_from[0] is not part:
+            self.cut_from = None  # a start marked in another part (or video) is forgotten
+        if self.cut_from is None:
+            self.cut_btn.configure(text="Cut out a section")
+            self.cut_note.configure(text="")
+            self.cut_cancel_btn.pack_forget()
+        else:
+            self.cut_btn.configure(text="End the cut here")
+            self.cut_note.configure(text=f"from {fmt_time(self.snap(self.cut_from[1]))}")
+            self.cut_cancel_btn.pack(side="left", padx=(8, 0))
+
     def move_removed(self, part: Part, i: int, edge: int, t: float,
-                     asked: float | None = None):
+                     asked: float | None = None, carry: bool = False):
         """Move one edge (0: from, 1: to) of a stretch left out of a part. t is on a
-        keyframe; asked is the time typed (or showing), if it was something else."""
+        keyframe; asked is the time typed (or showing), if it was something else. With
+        carry, an edge taken past the other one takes the whole stretch along, keeping
+        its length, rather than refusing."""
         if part not in self.parts or i >= len(part.removed) or self.busy:
             return
         stretch = list(part.removed[i])
         stretch[edge] = min(max(t, part.start), part.end)
+        carried = False
+        if carry and stretch[1] - stretch[0] <= EPS:
+            length = part.removed[i][1] - part.removed[i][0]
+            if edge == 0:
+                other = self.snap(min(stretch[0] + length, part.end))
+                if other <= stretch[0] + EPS:
+                    other = min(self.step_point(stretch[0], 1), part.end)
+                stretch[1] = other
+            else:
+                other = self.snap(max(stretch[1] - length, part.start))
+                if other >= stretch[1] - EPS:
+                    other = max(self.step_point(stretch[1], -1), part.start)
+                stretch[0] = other
+            carried = stretch[1] - stretch[0] > EPS
         if stretch[1] - stretch[0] <= EPS:
             self._say_removed(part, self._too_short(part, i, edge, t, asked), error=True)
             self.bell()
@@ -1655,14 +1736,15 @@ class App(BaseTk):
                                     f"one, {fmt_time(t)}.")
         else:
             self._say_removed(part, "")
-            self.status.configure(text=f"Leaves out {fmt_time(stretch[0])} to "
+            moved = "Moved the whole stretch: it now leaves" if carried else "Leaves"
+            self.status.configure(text=f"{moved} out {fmt_time(stretch[0])} to "
                                        f"{fmt_time(stretch[1])} ({stretch[1] - stretch[0]:.2f} s).")
         self._changed(select=part)
         # Show the join: the last picture before the stretch, or the first after it
         if edge == 0:
-            self.player.seek(stretch[0] - self.player.frame_duration, pause=True)
+            self.seek(stretch[0] - self.player.frame_duration, pause=True)
         else:
-            self.player.seek(stretch[1], pause=True)
+            self.seek(stretch[1], pause=True)
 
     def put_back(self, part: Part, i: int):
         if part in self.parts and i < len(part.removed) and not self.busy:
@@ -1744,7 +1826,7 @@ class App(BaseTk):
                 now = tip(ttk.Button(row, text="Now", style="Step.TButton",
                                      command=lambda i=i, edge=edge: self.move_removed(
                                          part, i, edge, self.snap(self.position),
-                                         asked=self.position)),
+                                         asked=self.position, carry=True)),
                           "Use the current time in the player.")
                 now.pack(side="left")
                 self.removed_widgets.append(now)
@@ -1768,7 +1850,7 @@ class App(BaseTk):
             var.set(fmt_time(part.removed[i][edge]))
             self.bell()
             return
-        self.move_removed(part, i, edge, self.snap(t), asked=t)
+        self.move_removed(part, i, edge, self.snap(t), asked=t, carry=True)
 
     def _step_removed(self, part: Part, i: int, edge: int, direction: int):
         if part in self.parts and i < len(part.removed) and not self.busy:
@@ -1861,6 +1943,7 @@ class App(BaseTk):
 
     def _show_selected(self):
         part = self._current() if self.info else None
+        self._show_cut_mark()
         if not part:
             self.title_var.set("")
             for side in ("start", "end"):
@@ -1889,7 +1972,7 @@ class App(BaseTk):
         self.player.set_range(part.start, part.end, [tuple(r) for r in part.removed])
         if part is not self.shown_part:
             self.shown_part = part
-            self.player.seek(part.start)  # carries on playing if it was
+            self.seek(part.start)  # carries on playing if it was
             self.timeline.follow(part.start)
         self._draw_timelines()
         self._update_time()
@@ -1949,8 +2032,8 @@ class App(BaseTk):
         self.move_cut(part, side, self.snap(asked), asked=asked)
 
     def move_cut(self, part: Part, side: str, t: float, asked: float | None = None):
-        """Move one end of a part (t already on a keyframe), and with "Keep touching
-        parts joined", the neighbour that shares that cut."""
+        """Move one end of a part (t already on a keyframe), and with "Moving a cut
+        moves the part next to it" checked, the neighbour that shares that cut."""
         if part not in self.parts:
             return
         old = getattr(part, side)
@@ -1982,9 +2065,9 @@ class App(BaseTk):
         self._changed(select=part)
         # Show the cut: the part's first frame, or its last
         if side == "start":
-            self.player.seek(t, pause=True)
+            self.seek(t, pause=True)
         else:
-            self.player.seek(t - self.player.frame_duration, pause=True)
+            self.seek(t - self.player.frame_duration, pause=True)
         notes = []
         if asked is not None and abs(asked - t) > EPS and not self.anywhere:
             notes.append(f"{fmt_time(asked)} isn't a keyframe: the cut is at the nearest one, "
@@ -2008,19 +2091,66 @@ class App(BaseTk):
         self.end_mode = next(k for k, v in END_MODES.items() if v == label)
         self.player.set_end_mode(self.end_mode)
 
+    def _video_clicked(self):
+        """A click on the picture plays or pauses; with no video yet, opens one."""
+        if self.info:
+            self.toggle_play()
+        elif not self.busy:
+            self._choose_file()
+
+    def show_shortcuts(self):
+        if getattr(self, "shortcuts_window", None) and self.shortcuts_window.winfo_exists():
+            self.shortcuts_window.lift()
+            return
+        win = self.shortcuts_window = tk.Toplevel(self, bg=PANEL)
+        win.title("Keyboard shortcuts")
+        win.transient(self)
+        win.resizable(False, False)
+        dark_title_bar(win)
+        box = ttk.Frame(win, style="Tab.TFrame", padding=16)
+        box.pack(fill="both", expand=True)
+        for row, (keys, what) in enumerate(SHORTCUTS):
+            ttk.Label(box, text=keys, style="BarStrong.TLabel").grid(
+                row=row, column=0, sticky="w", padx=(0, 18), pady=1)
+            ttk.Label(box, text=what, style="Tab.TLabel").grid(row=row, column=1, sticky="w")
+        ttk.Label(box, text=MOUSE, style="TabNote.TLabel", wraplength=380, justify="left"
+                  ).grid(row=len(SHORTCUTS), column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Button(box, text="Close", command=win.destroy).grid(
+            row=len(SHORTCUTS) + 1, column=1, sticky="e", pady=(12, 0))
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        win.geometry(f"+{self.winfo_rootx() + 80}+{self.winfo_rooty() + 80}")
+
     def toggle_play(self):
         if self.info:
             self.player.toggle()
 
+    # Every button works from where the last one was going, not from where the player
+    # has got to: it may still be finding an older frame, and the newest click wins.
+
+    def _landing(self, t: float) -> float:
+        """The frame the player shows when asked for t: the first from half a frame
+        before it."""
+        t = max(0.0, min(t, self.info.duration))
+        frames = self.info.frames
+        if not frames:
+            return t
+        i = bisect.bisect_left(frames, t - self.player.frame_duration / 2)
+        return frames[i] if i < len(frames) else frames[-1]
+
     def stop(self):
         if self.info:
+            part = self._current()
+            self.position = self._landing(part.start if part else 0.0)
             self.player.stop()
+            self._update_time()
 
-    def seek(self, t: float, exact: bool = True):
+    def seek(self, t: float, exact: bool = True, pause: bool = False):
         if not self.info:
             return
-        self.position = max(0.0, min(t, self.info.duration))
-        self.player.seek(self.position, exact=exact)
+        t = max(0.0, min(t, self.info.duration))
+        self.position = self._landing(t) if exact else t
+        self.player.seek(t, exact=exact, pause=pause)
         self._update_time()
 
     def jump(self, seconds: float):
@@ -2032,17 +2162,23 @@ class App(BaseTk):
                       else engine.previous_keyframe(self.info, self.position))
 
     def step(self, frames: int):
-        if self.info:
-            self.player.step(frames)
+        """Frames forward (or back), paused."""
+        if not self.info:
+            return
+        t = self.position
+        for _ in range(abs(frames)):
+            t = engine.next_frame(self.info, t) if frames > 0 \
+                else engine.previous_frame(self.info, t)
+        if self.info.frames:
+            t = min(t, self.info.frames[-1])  # the end of the video has no frame of its own
+        self.seek(t, pause=True)
 
     def go_part_edge(self, side: str):
         part = self._current()
         if not part:
             return
-        if side == "start":
-            self.player.seek(part.start, pause=True)
-        else:
-            self.player.seek(part.end - self.player.frame_duration, pause=True)
+        self.seek(part.start if side == "start" else part.end - self.player.frame_duration,
+                  pause=True)
 
     def zoom_to_part(self):
         part = self._current()
@@ -2355,6 +2491,8 @@ class App(BaseTk):
         """One message from a worker thread or the player."""
         kind = event[0]
         if kind == "pos":
+            if event[2] < self.player.moves_sent:
+                return  # from a move overtaken by a newer click: not where it's going
             self.position = event[1]
             self._update_time()
         elif kind == "state":

@@ -15,7 +15,7 @@ Three threads share the work, so a heavy picture can never starve the sound:
 
 The window talks to it through the methods at the top of Player, which only
 queue a command; the player reports back through the notify function it was
-given: ("pos", seconds), ("state", playing), ("loaded", has_picture),
+given: ("pos", seconds, moves done), ("state", playing), ("loaded", has_picture),
 ("saved", path), ("error", message).
 """
 
@@ -33,6 +33,8 @@ import av
 
 from splicer.engine import seek_before
 from splicer.subtitles import Cue, active, longest
+
+MOVES = ("seek", "stop", "step")  # commands that move the picture, numbered
 
 RATE = 48_000                  # what all sound is turned into: 48 kHz, 16-bit stereo
 BYTES_PER_SAMPLE = 4
@@ -378,8 +380,12 @@ class Screen:
             return
         try:
             if force_clear or rect != self.last_rect:
-                full = wintypes.RECT(0, 0, cw, ch)
-                self.user32.FillRect(dc, ctypes.byref(full), self.black)
+                # Black bars around the picture only: blacking out the picture too,
+                # then drawing it, flashed while the window changed size
+                for bar in ((0, 0, cw, dy), (0, dy + dh, cw, ch),
+                            (0, dy, dx, dy + dh), (dx + dw, dy, cw, dy + dh)):
+                    if bar[2] > bar[0] and bar[3] > bar[1]:
+                        self.user32.FillRect(dc, ctypes.byref(wintypes.RECT(*bar)), self.black)
                 self.last_rect = rect
             header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 24, 0,
                                       0, 0, 0, 0, 0)
@@ -470,6 +476,8 @@ class Player:
         self.has_picture = False
         self.position = 0.0
         self.playing = False
+        self.moves_sent = 0   # numbered moves asked for
+        self.moves_done = 0   # and the last one done (or skipped for a newer one)
         threading.Thread(target=self._run, daemon=True, name="player").start()
 
     # --- What the window calls (any thread) ---
@@ -491,16 +499,23 @@ class Player:
 
     def stop(self):
         """Pause, back at the start of the part (or the video)."""
-        self.commands.put(("stop",))
+        self.commands.put(("stop", self._move()))
 
     def seek(self, t: float, exact: bool = True, pause: bool = False):
         """Show the frame at t. Exact: that very frame; otherwise the keyframe
         before it, which is much quicker (for dragging along the bar)."""
-        self.commands.put(("seek", t, exact, pause))
+        self.commands.put(("seek", t, exact, pause, self._move()))
 
     def step(self, frames: int):
         """One frame forward (1) or back (-1), paused."""
-        self.commands.put(("step", frames))
+        self.commands.put(("step", frames, self._move()))
+
+    def _move(self) -> int:
+        """Number a command that moves the picture. Positions are reported with the
+        number of the last one done, so the window can tell an old one from the
+        newest (called from the window's thread only)."""
+        self.moves_sent += 1
+        return self.moves_sent
 
     def set_range(self, start: float | None, end: float | None, removed=()):
         """The selected part: where it starts and ends, and the stretches left out
@@ -564,8 +579,10 @@ class Player:
                 except queue.Empty:
                     break
             for i, command in enumerate(batch):
-                # Only the last of a run of seeks matters (dragging along the bar)
-                if command[0] == "seek" and any(c[0] == "seek" for c in batch[i + 1:]):
+                # A newer move overrides an older one still waiting: dragging along
+                # the bar, or clicking faster than frames can be found
+                if command[0] in MOVES and any(c[0] in ("seek", "stop") for c in batch[i + 1:]):
+                    self.moves_done = command[-1]
                     continue
                 try:
                     if self._command(command) is False:
@@ -575,6 +592,12 @@ class Player:
                 except Exception as e:  # an odd file shouldn't take the player down
                     self._halt()
                     self.notify(("error", str(e) or repr(e)))
+                if command[0] in MOVES:
+                    # Done only now it's there: on the way (pausing first, say) the
+                    # position reported is still the old one, and the window would
+                    # jump back to it
+                    self.moves_done = command[-1]
+                    self._report(force=True)
             if self.playing:
                 try:
                     self._tick()
@@ -649,10 +672,14 @@ class Player:
             start = self.range[0] if self.range[0] is not None else 0.0
             self._seek(start, exact=True)
         elif kind == "seek":
-            _, t, exact, pause = command
+            _, t, exact, pause, _ = command
             was = self.playing and not pause
             self._halt()
-            self._seek(t, exact)
+            if exact and self.video and self.frames_iter is not None and not self.eof and \
+                    EPS < t - self.position <= self.frame_duration * 1.5:
+                self._step_forward()  # the next frame: just decode on, no need to seek
+            else:
+                self._seek(t, exact)
             if was:
                 self._play()
         elif kind == "step":
@@ -942,6 +969,6 @@ class Player:
 
     def _report(self, force: bool = False):
         now = time.perf_counter()
-        if force or now - self.last_report > 0.04:
+        if force or now - self.last_report > 0.012:  # every frame: a smooth bar
             self.last_report = now
-            self.notify(("pos", self.position))
+            self.notify(("pos", self.position, self.moves_done))

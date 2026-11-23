@@ -119,3 +119,25 @@ def test_play_again_after_stopping_at_the_end_of_the_video(player):
     p.play()
     wait(p, events, lambda e: e[0] == "pos" and e[1] < 21.0, timeout=5)
     p.pause()
+
+
+def test_a_jump_while_playing_never_reports_the_old_place_as_new(player):
+    # Pausing on the way reported the old position under the new move's number,
+    # and the bar jumped back to it for a moment
+    p, events = player
+    p.seek(2.0)
+    p.play()
+    wait(p, events, lambda e: e[0] == "pos" and e[1] > 2.3)
+    p.seek(15.0)
+    seen = []
+    end = time.time() + 1.0
+    while time.time() < end:
+        try:
+            e = events.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        if e[0] == "pos" and e[2] == p.moves_sent:
+            seen.append(e[1])
+    p.pause()
+    assert seen and min(seen) >= 15.0 - 0.02
+    assert seen == sorted(seen)
