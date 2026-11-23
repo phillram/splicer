@@ -40,6 +40,10 @@ timeline. **Add part**, **Split** and **Remove** do what they say. Uncheck a
 part to skip it; Shift+click a checkbox to check or uncheck every part up to
 the last one you clicked. Everything can be undone with `Ctrl+Z`.
 
+Changing a part changes only that part. If a chapter boundary is wrong and
+you'd like the part next to it to follow, check **Moving a cut moves the part
+next to it**: then moving a cut that two parts share moves both.
+
 The timeline along the bottom shows the sound's waveform, which makes the gaps
 between songs or scenes easy to spot. `Ctrl+wheel` zooms in.
 

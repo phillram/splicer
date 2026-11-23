@@ -434,7 +434,7 @@ class App(BaseTk):
 
     # --- Settings ---
 
-    SETTING_TYPES = {"geometry": str, "numbered": bool, "joined": bool, "volume": (int, float),
+    SETTING_TYPES = {"geometry": str, "numbered": bool, "move_neighbor": bool, "volume": (int, float),
                      "end_mode": str, "save_as": str, "cut_mode": str, "last_dir": str,
                      "recent": list, "panes": list}
 
@@ -452,7 +452,8 @@ class App(BaseTk):
     def _save(self):
         self.settings["geometry"] = self.geometry()
         self.settings["numbered"] = bool(self.numbered_var.get())
-        self.settings["joined"] = bool(self.joined_var.get())
+        self.settings["move_neighbor"] = bool(self.joined_var.get())
+        self.settings.pop("joined", None)  # was on by default; editing one part moved another
         self.settings["volume"] = int(self.volume_var.get())
         self.settings["end_mode"] = self.end_mode
         self.settings["save_as"] = self.save_as
@@ -835,11 +836,13 @@ class App(BaseTk):
         self.cut_from: tuple | None = None  # (part, time) while a cut's start is marked
         self.removed_box = ttk.Frame(edit, style="Tab.TFrame")
         self.removed_box.grid(row=5, column=0, columnspan=2, sticky="ew")
-        self.joined_var = tk.BooleanVar(value=self.settings.get("joined", True))
+        # Off by default: editing one part leaves every other part alone
+        self.joined_var = tk.BooleanVar(value=self.settings.get("move_neighbor", False))
         tip(ttk.Checkbutton(edit, text="Moving a cut moves the part next to it", variable=self.joined_var,
                             style="Tab.TCheckbutton"),
             "When a part ends where the next one starts, moving that cut moves both, so "
-            "nothing falls between them.").grid(row=6, column=0, columnspan=2, sticky="w",
+            "nothing falls between them. Unchecked, only the part you're editing "
+            "changes.").grid(row=6, column=0, columnspan=2, sticky="w",
                                                 pady=(8, 0))
 
     def _build_player(self, box):
@@ -2029,8 +2032,8 @@ class App(BaseTk):
         self.move_cut(part, side, self.snap(asked), asked=asked)
 
     def move_cut(self, part: Part, side: str, t: float, asked: float | None = None):
-        """Move one end of a part (t already on a keyframe), and with "Keep touching
-        parts joined", the neighbour that shares that cut."""
+        """Move one end of a part (t already on a keyframe), and with "Moving a cut
+        moves the part next to it" checked, the neighbour that shares that cut."""
         if part not in self.parts:
             return
         old = getattr(part, side)

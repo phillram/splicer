@@ -355,3 +355,20 @@ def test_now_past_the_end_moves_the_whole_stretch(window):
     pump(a, 0.2)
     a.move_removed(part, 0, 1, a.snap(a.position), asked=a.position, carry=True)
     assert part.removed == [[13.5, 15.0]]
+
+
+def test_moving_a_cut_leaves_the_next_part_alone_by_default(window):
+    a = window
+    first, second = a.parts[0], a.parts[1]
+    assert abs(first.end - second.start) < 1e-6  # they share a cut
+    start = second.start
+    a.move_cut(first, "end", a.step_point(first.end, -1))
+    assert first.end < start and second.start == start
+
+
+def test_moving_a_cut_can_move_the_next_part_too(window):
+    a = window
+    a.joined_var.set(True)
+    first, second = a.parts[0], a.parts[1]
+    a.move_cut(first, "end", a.step_point(first.end, -1))
+    assert second.start == first.end
